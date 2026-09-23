@@ -347,15 +347,113 @@ async def test_fiat_history_falls_back_to_windows_on_error(monkeypatch: pytest.M
     assert "BTC: 0.002" in result
 
 
-async def test_fiat_history_unrecoverable_error_propagates_without_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fiat_history_wide_span_unrecoverable_error_still_reports_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fake = _FakeClient(queue=[_status_error("/sapi/v1/fiat/orders", 401, {"code": -2015, "msg": "Invalid API-key."})])
     monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
 
     result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", max_calls=10))
 
     assert len(fake.calls) == 1  # no fallback retry attempted — auth errors are not span-related
-    assert result.startswith("Error (401)")
+    assert not result.startswith("Error (401)")  # a graceful report, not a raw propagated error
     assert "fell back" not in result
+    assert "Fetched **0** row(s)" in result
+    assert "401" in result
+    assert "Invalid API-key" in result
+    match = re.search(r"resume_before=(-?\d+)", result)
+    assert match is not None
+
+
+async def test_fiat_history_mid_window_unrecoverable_error_keeps_rows_and_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocking repro: three windows succeed, the fourth returns 429 — the rows already
+    collected must survive, a resume cursor must be present, and the 429 message shown.
+    """
+    initial_end_ms = 1_700_000_000_000
+    since_ms = initial_end_ms - 5 * _WINDOW_MS
+
+    span_error = _status_error("/sapi/v1/fiat/orders", 400, {"code": -1127, "msg": "span too wide"})
+    window1_row = _order_row("K1", "1.00", "USD", initial_end_ms - 1000)
+    window2_row = _order_row("K2", "1.00", "USD", initial_end_ms - _WINDOW_MS - 2000)
+    rate_limit_error = _status_error("/sapi/v1/fiat/orders", 429, {"code": -1003, "msg": "Too many requests."})
+
+    fake = _FakeClient(
+        queue=[
+            span_error,
+            _orders_envelope([window1_row], total=1),  # window 1 (newest) succeeds
+            _orders_envelope([window2_row], total=1),  # window 2 succeeds
+            _orders_envelope([], total=0),  # window 3 succeeds, empty
+            rate_limit_error,  # window 4 -> 429, unrecoverable
+        ]
+    )
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(
+        FiatHistoryInput(kind="withdrawals", since=since_ms, resume_before=initial_end_ms, max_calls=10)
+    )
+
+    assert len(fake.calls) == 5
+    assert "**K1**" in result
+    assert "**K2**" in result
+    assert "Fetched **2** row(s)" in result
+    assert "429" in result
+    assert "Too many requests" in result
+    match = re.search(r"resume_before=(-?\d+)", result)
+    assert match is not None
+    assert "re-covers the same range, it does not advance" in result
+
+
+async def test_fiat_history_recoverable_window_error_names_cause_not_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recoverable-shaped error mid-window (e.g. -1102) must not be mislabelled as a
+    budget stop — there is no further fallback to try once inside a window, so it must
+    name the real cause.
+    """
+    recent_since_ms = int(time.time() * 1000) - 5 * 24 * 60 * 60 * 1000
+    span_error = _status_error("/sapi/v1/fiat/orders", 400, {"code": -1127, "msg": "span too wide"})
+    window_error = _status_error("/sapi/v1/fiat/orders", 400, {"code": -1102, "msg": "Mandatory parameter missing."})
+    fake = _FakeClient(queue=[span_error, window_error])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", since=recent_since_ms, max_calls=10))
+
+    assert len(fake.calls) == 2
+    assert "-1102" in result
+    assert "max_calls` budget" not in result  # not misattributed to the budget
+    assert "re-covers the same range, it does not advance" in result
+
+
+async def test_fiat_history_resume_wording_distinguishes_redo_from_advance(monkeypatch: pytest.MonkeyPatch) -> None:
+    # REDO: a window's OWN pagination runs out of budget mid-window.
+    span_error = _status_error("/sapi/v1/fiat/orders", 400, {"code": -1127, "msg": "span too wide"})
+    full_window_page = _orders_envelope(
+        [_order_row("R1", "1.00", "USD", 1700000000000), _order_row("R2", "1.00", "USD", 1700000001000)], total=99
+    )
+    fake_redo = _FakeClient(queue=[span_error, full_window_page])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake_redo)
+
+    redo_result = await binance_get_fiat_history(FiatHistoryInput(kind="withdrawals", rows=2, max_calls=2))
+
+    assert "re-covers the same range, it does not advance" in redo_result
+    assert "were not fetched; call again with" not in redo_result  # the ADVANCE-only phrasing
+
+    # ADVANCE: budget runs out before the NEXT window can even start (every window up to
+    # the cursor is fully covered).
+    fake_advance = _FakeClient(
+        queue=[
+            _status_error("/sapi/v1/fiat/orders", 400, {"code": -1127, "msg": "span too wide"}),
+            _orders_envelope([_order_row("A1", "1.00", "USD", 1_699_000_000_000)], total=1),
+        ]
+    )
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake_advance)
+
+    advance_result = await binance_get_fiat_history(
+        FiatHistoryInput(kind="withdrawals", since=1_000_000_000_000, resume_before=1_700_000_000_000, max_calls=2)
+    )
+
+    assert "were not fetched; call again with" in advance_result
+    assert "re-covers the same range" not in advance_result
 
 
 async def test_fiat_history_wide_span_budget_exhausted_resumes_at_end(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -371,6 +469,7 @@ async def test_fiat_history_wide_span_budget_exhausted_resumes_at_end(monkeypatc
 
     assert len(fake.calls) == 1
     assert "Stopped early" in result
+    assert "re-covers the same range, it does not advance" in result
     # Page order within a single wide span is undocumented, so there is no safe
     # narrower boundary — resume_before falls back to the original end (now).
     match = re.search(r"resume_before=(\d+)", result)

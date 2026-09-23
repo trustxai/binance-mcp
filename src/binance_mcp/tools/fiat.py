@@ -511,19 +511,26 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
     resuming) and pages `page` until a short page signals the end. If that wide-span
     attempt fails with a plausibly span-related HTTP error (commonly -1127, an
     undocumented span cap on these two endpoints), falls back to walking 30-day windows
-    newest-first instead. An auth, rate-limit, envelope (`success: false`), or other
-    non-HTTP failure is NOT treated as span-related and propagates immediately as
-    `Error: ...` — retrying with a narrower window would not fix it.
+    newest-first instead.
 
     Honors a `max_calls` budget so one invocation can never blow past the weight-limited
     call rate — deposits/withdrawals cost UID 45000/call (default budget 4, i.e. the
     whole 180000/min UID budget for a minute), buys/sells cost IP 1/call (default budget
     20). Every request checks the budget first, and a request that itself errors still
-    counts against it, since it still spent real quota. When the budget runs out — or a
-    span-related error interrupts a window partway through — the walk stops and returns
-    whatever rows it already collected plus a `resume_before` cursor: the boundary of
-    the next unfetched range. Binance treats `endTime` as inclusive, so the boundary row
-    may come back again on resume; rows are deduped by `orderNo` before being returned.
+    counts against it, since it still spent real quota.
+
+    The walk NEVER discards rows it already has: whenever it stops early — budget
+    exhaustion or ANY request failure, span-related or not — it renders the normal
+    report (rows collected so far, totals, call count) plus a `resume_before` cursor,
+    and for a failure it also shows the underlying error (via `handle_api_error`) as a
+    prominent line. Binance treats `endTime` as inclusive, so a re-fetched boundary row
+    is expected; rows are deduped by `orderNo` before being returned. The cursor comes
+    in two flavours, worded differently so one is never mistaken for the other: a
+    **redo** cursor (the wide span, or the window in progress, was not fully covered —
+    page order inside it is undocumented, so the whole thing must be retried) says it
+    "re-covers the same range, it does not advance"; an **advance** cursor (every window
+    up to it is fully covered; only the budget stopped a NEW window from starting) says
+    rows "were not fetched" before it and to "continue" from there.
 
     Status values Binance returns for fiat orders/payments: Processing, Failed,
     Successful, Finished, Refunding, Refunded, Refund Failed, Order Partial credit
@@ -544,7 +551,8 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
     Deduped rows sorted newest-first (display capped at 50, JSON keeps the full walked
     set), a per-fiat-currency total (and, for buys/sells, a per-crypto-currency received
     total), how many API calls were spent, whether the window fallback triggered, and —
-    when the walk stopped early — a `resume_before` cursor.
+    when the walk stopped early — a `resume_before` cursor plus (for a failure) the
+    error that caused the stop.
 
     Examples:
     params = {"kind": "deposits"}
@@ -553,12 +561,13 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
 
     Error Handling:
     A span-related HTTP error on the wide-span attempt triggers the 30-day-window
-    fallback automatically; the same kind of error partway through a window stops the
-    walk early — rows collected so far are still returned, with a `resume_before`
-    cursor — instead of discarding them. Any other failure (bad signature, rate limit,
-    `success: false` envelope) propagates immediately as `Error: ...` with no fallback
-    attempt, since narrowing the window would not fix it. A malformed since/resume_before
-    returns `Error: <field> must be epoch milliseconds or an ISO-8601 string`.
+    fallback automatically. Any failure after that point — inside a window, or an
+    auth/rate-limit/envelope/other error that was never span-related — stops the walk
+    instead of raising: the response still shows the rows already collected, the
+    API-call count, a `resume_before` cursor, and the failure itself via
+    `handle_api_error`. A malformed since/resume_before returns
+    `Error: <field> must be epoch milliseconds or an ISO-8601 string` before any call
+    is made.
     """
     try:
         client = get_client()
@@ -576,12 +585,14 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
 
         all_rows: list[dict[str, Any]] = []
         calls_made = 0
-        budget_exhausted = False
         used_fallback = False
+        stop_reason: Literal["budget", "error"] | None = None
+        stop_error: Exception | None = None
         resume_before_ms: int | None = None
+        resume_is_redo = False
 
         try:
-            all_rows, calls_made, budget_exhausted = await _walk_span(
+            all_rows, calls_made, exhausted = await _walk_span(
                 client,
                 endpoint=endpoint,
                 transaction_type=transaction_type,
@@ -591,23 +602,32 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
                 max_calls=max_calls,
                 calls_made=0,
             )
-            if budget_exhausted:
+            if exhausted:
                 # Page order within the wide span is undocumented, so there is no safe
                 # partial boundary — the whole span must be retried with a bigger budget.
+                stop_reason = "budget"
                 resume_before_ms = end_ms
+                resume_is_redo = True
         except _WalkError as werr:
-            if not _is_recoverable(werr.cause):
-                raise werr.cause from werr
-            used_fallback = True
+            # Never discard what a failed attempt already collected, whether or not the
+            # failure is the kind that's worth retrying via the windowed fallback.
             all_rows = werr.rows
             calls_made = werr.calls_made
+            if _is_recoverable(werr.cause):
+                used_fallback = True
+            else:
+                stop_reason = "error"
+                stop_error = werr.cause
+                resume_before_ms = end_ms
+                resume_is_redo = True
 
         if used_fallback:
             window_end = end_ms
             while window_end >= since_ms:
                 if calls_made >= max_calls:
-                    budget_exhausted = True
+                    stop_reason = "budget"
                     resume_before_ms = window_end
+                    resume_is_redo = False
                     break
                 window_start = max(since_ms, window_end - _WINDOW_MS)
                 try:
@@ -622,17 +642,20 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
                         calls_made=calls_made,
                     )
                 except _WalkError as werr:
-                    if not _is_recoverable(werr.cause):
-                        raise werr.cause from werr
+                    # Once inside a window there is no further fallback to try — any
+                    # failure here, recoverable-shaped or not, just stops the walk.
                     all_rows.extend(werr.rows)
                     calls_made = werr.calls_made
-                    budget_exhausted = True
+                    stop_reason = "error"
+                    stop_error = werr.cause
                     resume_before_ms = window_end
+                    resume_is_redo = True
                     break
                 all_rows.extend(window_rows)
                 if window_exhausted:
-                    budget_exhausted = True
+                    stop_reason = "budget"
                     resume_before_ms = window_end  # redo this same window on resume
+                    resume_is_redo = True
                     break
                 window_end = window_start - 1
 
@@ -653,6 +676,9 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
                 "calls_made": calls_made,
                 "used_fallback": used_fallback,
                 "resume_before": resume_before_ms,
+                "resume_is_redo": resume_is_redo if resume_before_ms is not None else None,
+                "stop_reason": stop_reason,
+                "stop_error": handle_api_error(stop_error) if stop_error is not None else None,
                 "count": len(all_rows),
                 "totals": {currency: str(total) for currency, total in totals.items()},
                 "crypto_totals": (
@@ -669,7 +695,20 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
             + (" (fell back to 30-day windows)" if used_fallback else "")
             + ".",
         ]
-        if budget_exhausted:
+        if stop_reason == "error":
+            assert stop_error is not None
+            lines.append(f"⚠️ Stopped early — {handle_api_error(stop_error)}")
+            lines.append(
+                f"`resume_before={resume_before_ms}` re-covers the same range, it does not advance — call "
+                "again with a larger `max_calls`, a narrower `since`, or once the underlying issue is resolved."
+            )
+        elif stop_reason == "budget" and resume_is_redo:
+            lines.append(
+                f"⚠️ Stopped early — the budget stopped this span partway (`max_calls={max_calls}`). Call "
+                f"again with a larger `max_calls` (or a narrower `since`); `resume_before={resume_before_ms}` "
+                "re-covers the same range, it does not advance."
+            )
+        elif stop_reason == "budget":
             lines.append(
                 f"⚠️ Stopped early — the `max_calls` budget ({max_calls}) ran out. "
                 f"Rows before {epoch_to_human(resume_before_ms)} were not fetched; call again with "
