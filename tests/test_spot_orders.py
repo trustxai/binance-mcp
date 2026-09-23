@@ -281,6 +281,61 @@ async def test_place_order_market_quote_order_qty(monkeypatch: pytest.MonkeyPatc
     ]
 
 
+async def test_place_order_expired_does_not_read_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A FOK/IOC that never rested is NOT a placed order — the heading must say so."""
+    expired = {
+        "symbol": "BTCUSDT",
+        "orderId": 40,
+        "orderListId": -1,
+        "clientOrderId": "fok-1",
+        "transactTime": 1758500000000,
+        "price": "20000.10",
+        "origQty": "0.00100000",
+        "executedQty": "0.00000000",
+        "cummulativeQuoteQty": "0.00000000",
+        "status": "EXPIRED",
+        "timeInForce": "FOK",
+        "type": "LIMIT",
+        "side": "BUY",
+        "fills": [],
+    }
+    fake = _FakeClient(routes={"/api/v3/order": expired})
+    _patch(monkeypatch, fake)
+
+    result = await binance_place_order(PlaceOrderInput(**{**LIMIT_ORDER, "time_in_force": "FOK"}))
+
+    assert result.startswith("# Order NOT live (EXPIRED) on BTCUSDT")
+    assert "# Order placed" not in result
+    assert "_Status **EXPIRED**: nothing was filled; the order is not on the book._" in result
+    assert "still working on the book" not in result
+
+
+async def test_place_order_expired_after_partial_fill_states_what_filled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An IOC can expire *after* filling part of the order: do not claim nothing traded."""
+    partial = {
+        "symbol": "BTCUSDT",
+        "orderId": 41,
+        "orderListId": -1,
+        "clientOrderId": "ioc-1",
+        "transactTime": 1758500000000,
+        "origQty": "0.00100000",
+        "executedQty": "0.00040000",
+        "cummulativeQuoteQty": "8.00004000",
+        "status": "EXPIRED",
+        "timeInForce": "IOC",
+        "type": "LIMIT",
+        "side": "BUY",
+    }
+    fake = _FakeClient(routes={"/api/v3/order": partial})
+    _patch(monkeypatch, fake)
+
+    result = await binance_place_order(PlaceOrderInput(**{**LIMIT_ORDER, "time_in_force": "IOC"}))
+
+    assert result.startswith("# Order NOT live (EXPIRED) on BTCUSDT")
+    assert "it filled 0.0004 and the remainder is not on the book" in result
+    assert "nothing was filled" not in result
+
+
 async def test_place_order_kill_switch_message_is_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
     """The client's kill-switch surfaces as `Error: … trading is disabled …`, unaltered."""
     message = (
@@ -524,9 +579,14 @@ async def test_cancel_all_open_orders_renders_orders_and_list_legs(monkeypatch: 
     result = await binance_cancel_all_open_orders(CancelAllOpenOrdersInput(symbol="BTCUSDT"))
 
     assert "cancelled **1** order(s) and **1** order list(s)" in result
+    assert "### Cancelled orders" in result
     assert "## Order list 99 (OCO)" in result
+    assert "### Legs" in result
     assert "| 31 |" in result
     assert "| 32 |" in result
+    # The nested tables carry their own heading; no stray "# Cancelled orders" title.
+    assert "\n# Cancelled orders" not in result
+    assert "\n# Legs" not in result
     assert fake.calls == [("DELETE", "/api/v3/openOrders", {"auth": "signed", "params": {"symbol": "BTCUSDT"}})]
 
 
@@ -661,8 +721,12 @@ async def test_cancel_replace_requires_exactly_one_cancel_id(monkeypatch: pytest
     assert fake.calls == []
 
 
-async def test_cancel_replace_error_path_409(monkeypatch: pytest.MonkeyPatch) -> None:
-    """HTTP 409 = the cancel succeeded and the replacement failed."""
+async def test_cancel_replace_error_path_409_names_the_cancelled_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP 409 = the cancel succeeded and the replacement failed.
+
+    The caller MUST be able to see which order is gone, so the 409 body's `data` is
+    rendered with the same breakdown as a 200 — not collapsed into a one-line error.
+    """
     fake = _FakeClient(
         routes={
             "/api/v3/order/cancelReplace": _status_error(
@@ -672,7 +736,15 @@ async def test_cancel_replace_error_path_409(monkeypatch: pytest.MonkeyPatch) ->
                 {
                     "code": -2021,
                     "msg": "Order cancel-replace partially failed",
-                    "data": {"cancelResult": "SUCCESS", "newOrderResult": "FAILURE"},
+                    "data": {
+                        "cancelResult": "SUCCESS",
+                        "newOrderResult": "FAILURE",
+                        "cancelResponse": {**CANCELLED, "orderId": 28},
+                        "newOrderResponse": {
+                            "code": -2010,
+                            "msg": "Account has insufficient balance for requested action.",
+                        },
+                    },
                 },
             )
         }
@@ -685,6 +757,31 @@ async def test_cancel_replace_error_path_409(monkeypatch: pytest.MonkeyPatch) ->
 
     assert result.startswith("Error (409)")
     assert "Partial success" in result
+    assert "**cancelResult**: SUCCESS" in result
+    assert "**newOrderResult**: FAILURE" in result
+    assert "## Cancelled order" in result
+    assert "**orderId**: 28" in result  # which order is gone
+    assert "insufficient balance" in result
+    assert "The replacement is NOT live" in result
+
+
+async def test_cancel_replace_non_409_error_stays_a_plain_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(
+        routes={
+            "/api/v3/order/cancelReplace": _status_error(
+                "POST", "/api/v3/order/cancelReplace", 400, {"code": -2011, "msg": "Unknown order sent."}
+            )
+        }
+    )
+    _patch(monkeypatch, fake)
+
+    result = await binance_cancel_replace_order(
+        CancelReplaceOrderInput(**LIMIT_ORDER, cancel_replace_mode="STOP_ON_FAILURE", cancel_order_id=28)
+    )
+
+    assert result.startswith("Error (400)")
+    assert "(code -2011)" in result
+    assert "cancelResult" not in result
 
 
 # -- binance_get_open_orders ----------------------------------------------------------
@@ -868,26 +965,57 @@ async def test_market_requires_exactly_one_quantity_field(monkeypatch: pytest.Mo
     assert fake.calls == []
 
 
-async def test_stop_loss_requires_quantity_and_exactly_one_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stop_loss_requires_quantity_and_a_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient()
     _patch(monkeypatch, fake)
 
     with pytest.raises(ValidationError, match="missing: quantity"):
         PlaceOrderInput(symbol="BTCUSDT", side="SELL", type="STOP_LOSS", stop_price="19000")
-    with pytest.raises(ValidationError, match="exactly one trigger"):
+    with pytest.raises(ValidationError, match="require a trigger"):
         PlaceOrderInput(symbol="BTCUSDT", side="SELL", type="STOP_LOSS", quantity="0.001")
-    with pytest.raises(ValidationError, match="exactly one trigger"):
-        PlaceOrderInput(
+    assert fake.calls == []
+
+
+async def test_stop_loss_accepts_stop_price_combined_with_trailing_delta(monkeypatch: pytest.MonkeyPatch) -> None:
+    """rest-api.md L2193: trailingDelta CAN be combined with stopPrice (activation price).
+
+    A trailing stop with an activation price is a legitimate order; rejecting it locally
+    would refuse something Binance accepts.
+    """
+    fake = _FakeClient(routes={"/api/v3/order/test": {}})
+    _patch(monkeypatch, fake)
+
+    result = await binance_test_order(
+        TestOrderInput(
             symbol="BTCUSDT", side="SELL", type="STOP_LOSS", quantity="0.001", stop_price="19000", trailing_delta="100"
         )
-    assert fake.calls == []
+    )
+
+    assert "Order validation passed" in result
+    assert fake.calls == [
+        (
+            "POST",
+            "/api/v3/order/test",
+            {
+                "auth": "signed",
+                "params": {
+                    "symbol": "BTCUSDT",
+                    "side": "SELL",
+                    "type": "STOP_LOSS",
+                    "quantity": "0.001",
+                    "stopPrice": "19000",
+                    "trailingDelta": "100",
+                },
+            },
+        )
+    ]
 
 
 async def test_take_profit_requires_a_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient()
     _patch(monkeypatch, fake)
 
-    with pytest.raises(ValidationError, match="exactly one trigger"):
+    with pytest.raises(ValidationError, match="require a trigger"):
         PlaceOrderInput(symbol="BTCUSDT", side="SELL", type="TAKE_PROFIT", quantity="0.001")
     assert fake.calls == []
 
@@ -964,6 +1092,41 @@ async def test_iceberg_qty_requires_gtc(monkeypatch: pytest.MonkeyPatch) -> None
             iceberg_qty="0.1",
         )
     assert fake.calls == []
+
+
+async def test_iceberg_qty_restricted_to_limit_priced_types(monkeypatch: pytest.MonkeyPatch) -> None:
+    """icebergQty only exists on LIMIT, STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT (S2 L2170)."""
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+
+    with pytest.raises(ValidationError, match="only accepted on LIMIT, STOP_LOSS_LIMIT"):
+        PlaceOrderInput(symbol="BTCUSDT", side="BUY", type="MARKET", quantity="1", iceberg_qty="0.1")
+    with pytest.raises(ValidationError, match="only accepted on LIMIT, STOP_LOSS_LIMIT"):
+        PlaceOrderInput(
+            symbol="BTCUSDT", side="SELL", type="LIMIT_MAKER", quantity="1", price="20000", iceberg_qty="0.1"
+        )
+    assert fake.calls == []
+
+
+async def test_iceberg_qty_accepted_on_stop_loss_limit_with_gtc(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(routes={"/api/v3/order/test": {}})
+    _patch(monkeypatch, fake)
+
+    result = await binance_test_order(
+        TestOrderInput(
+            symbol="BTCUSDT",
+            side="SELL",
+            type="STOP_LOSS_LIMIT",
+            time_in_force="GTC",
+            quantity="1",
+            price="19000",
+            stop_price="19100",
+            iceberg_qty="0.1",
+        )
+    )
+
+    assert "Order validation passed" in result
+    assert fake.calls[0][2]["params"]["icebergQty"] == "0.1"
 
 
 async def test_amount_fields_must_be_positive_decimal_strings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1050,14 +1213,23 @@ async def test_trading_round_trip_on_testnet(monkeypatch: pytest.MonkeyPatch) ->
     BINANCE_ALLOW_TRADING is set here because the client's kill-switch reads that variable,
     while the conftest gate reads BINANCE_TEST_ALLOW_TRADING: opting into the marker is the
     deliberate act, this just wires it through.
+
+    The env-var check is NOT sufficient on its own: `Settings.base_url` only falls back to
+    the testnet when BINANCE_API_URL is still the default, so BINANCE_TESTNET=1 plus a
+    custom BINANCE_API_URL routes this straight to mainnet — with real money. The effective
+    base URL is therefore asserted against TESTNET_API_URL before the first request.
     """
     from binance_mcp.client import get_client
-    from binance_mcp.config import get_settings
+    from binance_mcp.config import TESTNET_API_URL, get_settings
 
     monkeypatch.setenv("BINANCE_ALLOW_TRADING", "1")
     get_settings.cache_clear()
     monkeypatch.setattr("binance_mcp.client._client", None)
     assert os.environ.get("BINANCE_TESTNET", "").lower() in ("1", "true", "yes")
+    assert get_settings().base_url == TESTNET_API_URL, (
+        "refusing to place an order: BINANCE_TESTNET=1 but the effective base URL is "
+        f"{get_settings().base_url!r}, not the testnet — a custom BINANCE_API_URL overrides the flag."
+    )
 
     symbol = "BTCUSDT"
     client = get_client()

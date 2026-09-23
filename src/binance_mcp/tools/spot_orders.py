@@ -35,6 +35,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, Self
 
+import httpx
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -51,6 +52,12 @@ MAX_DISPLAY_ROWS = 50
 _ORDER_WINDOW_MS = 24 * 60 * 60 * 1000
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}$")
+
+# Statuses that mean the placement produced no live order: nothing rests on the book.
+_NOT_LIVE_STATUSES = ("EXPIRED", "EXPIRED_IN_MATCH", "REJECTED")
+
+# `icebergQty` is only accepted on the three resting LIMIT-priced types (S2 L2170).
+_ICEBERG_TYPES = ("LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT")
 
 
 # -- enums ---------------------------------------------------------------------------
@@ -127,6 +134,14 @@ class OrderRateLimitExceededMode(StrEnum):
 
 def _as_str(value: Any) -> str:
     return str(value)
+
+
+def _decimal_or_zero(value: Any) -> Decimal:
+    """Parse a Binance decimal string for a comparison; anything malformed counts as zero."""
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return Decimal(0)
 
 
 def _normalize_symbol(value: str) -> str:
@@ -253,6 +268,35 @@ def _fills_lines(fills: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _cancel_replace_lines(data: dict[str, Any]) -> list[str]:
+    """Render a cancelReplace body — the same shape on 200 and inside a 409's `data`.
+
+    Both halves are rendered separately and unconditionally, because the whole point of
+    this response is telling the caller WHICH order is gone and which one is live.
+    """
+    lines = [
+        f"- **cancelResult**: {data.get('cancelResult', 'N/A')}",
+        f"- **newOrderResult**: {data.get('newOrderResult', 'N/A')}",
+    ]
+    for key, heading in (("cancelResponse", "Cancelled order"), ("newOrderResponse", "New order")):
+        body = data.get(key)
+        if not isinstance(body, dict):
+            continue
+        lines.append("")
+        lines.append(f"## {heading}")
+        lines.append("")
+        detail = _order_detail_lines(body)
+        if detail:
+            lines.extend(detail)
+            fills = body.get("fills")
+            if isinstance(fills, list):
+                lines.extend(_fills_lines(fills))
+        else:
+            # A failed half is `{code, msg, data}`, not an order — show it verbatim.
+            lines.append(f"```json\n{to_json(body)}\n```")
+    return lines
+
+
 def _order_table(orders: list[dict[str, Any]], title: str) -> list[str]:
     """Compact table for the list tools (open orders / all orders)."""
     lines = [f"# {title}", ""]
@@ -312,9 +356,8 @@ class _OrderParams(_SymbolInput):
         description=(
             "Order type. Mandatory extras per type — LIMIT: time_in_force + quantity + price; "
             "MARKET: quantity OR quote_order_qty (exactly one); STOP_LOSS / TAKE_PROFIT: quantity + "
-            "(stop_price OR trailing_delta, exactly one); STOP_LOSS_LIMIT / TAKE_PROFIT_LIMIT: "
-            "time_in_force + quantity + price + stop_price and/or trailing_delta; "
-            "LIMIT_MAKER: quantity + price."
+            "stop_price and/or trailing_delta; STOP_LOSS_LIMIT / TAKE_PROFIT_LIMIT: time_in_force + "
+            "quantity + price + stop_price and/or trailing_delta; LIMIT_MAKER: quantity + price."
         )
     )
     time_in_force: TimeInForce | None = Field(
@@ -344,12 +387,15 @@ class _OrderParams(_SymbolInput):
         default=None,
         description=(
             "Trailing-stop distance in BIPS as a STRING ('100' = 1 percent). Binance: trailingDelta. "
-            "An alternative trigger to stop_price."
+            "A trigger on its own, or combined with stop_price as the activation price."
         ),
     )
     iceberg_qty: str | None = Field(
         default=None,
-        description="Visible slice of the order as a decimal STRING; requires time_in_force=GTC. Binance: icebergQty.",
+        description=(
+            "Visible slice of the order as a decimal STRING. Binance: icebergQty — only accepted on "
+            "LIMIT, STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT orders, and only with time_in_force=GTC."
+        ),
     )
     new_client_order_id: str | None = Field(
         default=None,
@@ -364,7 +410,8 @@ class _OrderParams(_SymbolInput):
         default=None,
         description=(
             "How much detail Binance returns: ACK (ids only), RESULT (adds status/quantities) or "
-            "FULL (adds the fills). MARKET and LIMIT default to FULL. Binance: newOrderRespType."
+            "FULL (adds the fills). MARKET and LIMIT default to FULL; all other order types default "
+            "to ACK. Binance: newOrderRespType."
         ),
     )
     self_trade_prevention_mode: SelfTradePreventionMode | None = Field(
@@ -404,10 +451,10 @@ class _OrderParams(_SymbolInput):
                 )
         elif order_type in (OrderType.STOP_LOSS, OrderType.TAKE_PROFIT):
             _require_fields(self, ("quantity",), "quantity")
-            if (self.stop_price is None) == (self.trailing_delta is None):
+            if self.stop_price is None and self.trailing_delta is None:
                 raise ValueError(
-                    f"{order_type.value} orders require exactly one trigger: stop_price (Binance: stopPrice) "
-                    "or trailing_delta (Binance: trailingDelta, in BIPS) — not both, not neither."
+                    f"{order_type.value} orders require a trigger: stop_price (Binance: stopPrice) "
+                    "and/or trailing_delta (Binance: trailingDelta, in BIPS)."
                 )
         elif order_type in (OrderType.STOP_LOSS_LIMIT, OrderType.TAKE_PROFIT_LIMIT):
             _require_fields(self, ("time_in_force", "quantity", "price"), "timeInForce, quantity, price")
@@ -418,11 +465,17 @@ class _OrderParams(_SymbolInput):
                 )
         elif order_type is OrderType.LIMIT_MAKER:
             _require_fields(self, ("quantity", "price"), "quantity, price")
-        if self.iceberg_qty is not None and self.time_in_force is not TimeInForce.GTC:
-            raise ValueError(
-                "iceberg_qty (Binance: icebergQty) is only accepted with time_in_force=GTC; "
-                f"got time_in_force={self.time_in_force.value if self.time_in_force else None}."
-            )
+        if self.iceberg_qty is not None:
+            if order_type.value not in _ICEBERG_TYPES:
+                raise ValueError(
+                    "iceberg_qty (Binance: icebergQty) is only accepted on LIMIT, STOP_LOSS_LIMIT and "
+                    f"TAKE_PROFIT_LIMIT orders; got type={order_type.value}."
+                )
+            if self.time_in_force is not TimeInForce.GTC:
+                raise ValueError(
+                    "iceberg_qty (Binance: icebergQty) is only accepted with time_in_force=GTC; "
+                    f"got time_in_force={self.time_in_force.value if self.time_in_force else None}."
+                )
         return self
 
     def to_params(self) -> dict[str, Any]:
@@ -727,7 +780,9 @@ async def binance_place_order(params: PlaceOrderInput) -> str:
     A confirmation echoing exactly what Binance returned: symbol, orderId,
     clientOrderId, status, executedQty, cummulativeQuoteQty, and the fills table when the
     response carries one. Nothing is inferred: with `new_order_resp_type="ACK"` Binance
-    reports only the ids, and the confirmation says so rather than implying a fill.
+    reports only the ids, and the confirmation says so rather than implying a fill. When
+    Binance answers EXPIRED / EXPIRED_IN_MATCH / REJECTED the heading reads **Order NOT
+    live** — an IOC/FOK that never rested is not a placed order.
 
     Examples:
         params = {"symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
@@ -755,22 +810,36 @@ async def binance_place_order(params: PlaceOrderInput) -> str:
         client = get_client()
         resp = await client.request("POST", "/api/v3/order", auth="signed", params=query)
         order = resp.json()
-        lines = [f"# Order placed on {params.symbol}", ""]
+        status = order.get("status")
+        not_live = status in _NOT_LIVE_STATUSES
+        header = f"# Order NOT live ({status}) on {params.symbol}" if not_live else f"# Order placed on {params.symbol}"
+        lines = [header, ""]
         lines.extend(_order_detail_lines(order))
         fills = order.get("fills")
         if isinstance(fills, list):
             lines.extend(_fills_lines(fills))
-        if "status" not in order:
+        if status is None:
             lines.append("")
             lines.append(
                 "_Binance answered with an acknowledgement only (no status or quantities). The order was "
                 "accepted; its execution state is unknown from this response — query it with "
                 "`binance_get_order`._"
             )
-        elif order.get("status") in ("NEW", "PARTIALLY_FILLED"):
+        elif not_live:
+            # An IOC/FOK can expire *after* filling part of the order: say which it was
+            # rather than assuming nothing traded.
+            executed = _decimal_or_zero(order.get("executedQty"))
+            filled = (
+                f"it filled {fmt_num(order.get('executedQty'))} and the remainder is not on the book"
+                if executed > 0
+                else "nothing was filled; the order is not on the book"
+            )
+            lines.append("")
+            lines.append(f"_Status **{status}**: {filled}._")
+        elif status in ("NEW", "PARTIALLY_FILLED"):
             lines.append("")
             lines.append(
-                f"_Status **{order['status']}**: the order is still working on the book. Track it with "
+                f"_Status **{status}**: the order is still working on the book. Track it with "
                 "`binance_get_open_orders` or cancel it with `binance_cancel_order`._"
             )
         return clip_response("\n".join(lines))
@@ -957,7 +1026,9 @@ async def binance_cancel_all_open_orders(params: CancelAllOpenOrdersInput) -> st
         lines.append(f"Binance cancelled **{len(orders):,}** order(s) and **{len(lists):,}** order list(s).")
         if orders:
             lines.append("")
-            lines.extend(_order_table(orders, "Cancelled orders")[1:])
+            lines.append("### Cancelled orders")
+            lines.append("")
+            lines.extend(_order_table(orders, "Cancelled orders")[2:])
         for entry in lists[:MAX_DISPLAY_ROWS]:
             lines.append("")
             lines.append(f"## Order list {entry.get('orderListId')} ({entry.get('contingencyType', 'N/A')})")
@@ -966,7 +1037,9 @@ async def binance_cancel_all_open_orders(params: CancelAllOpenOrdersInput) -> st
             reports = entry.get("orderReports") or []
             if reports:
                 lines.append("")
-                lines.extend(_order_table(reports, "Legs")[1:])
+                lines.append("### Legs")
+                lines.append("")
+                lines.extend(_order_table(reports, "Legs")[2:])
         return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
@@ -998,8 +1071,10 @@ async def binance_cancel_replace_order(params: CancelReplaceOrderInput) -> str:
       you can end up with both orders live, or neither.
 
     **HTTP 409 is the partial-success case**: the cancel succeeded and the new order
-    failed. It is returned as `Error (409): Partial success …` — read it as "the old order
-    is gone, the replacement is NOT live" and re-place deliberately.
+    failed. It is returned as `Error (409): Partial success …` followed by the same
+    cancelResult / newOrderResult breakdown as a success — so you can see exactly which
+    order was cancelled. Read it as "the old order is gone, the replacement is NOT live"
+    and re-place deliberately.
 
     When to Use:
     - Repricing or resizing a resting limit order.
@@ -1038,38 +1113,34 @@ async def binance_cancel_replace_order(params: CancelReplaceOrderInput) -> str:
         client = get_client()
         resp = await client.request("POST", "/api/v3/order/cancelReplace", auth="signed", params=query)
         data = resp.json()
-        lines = [
-            f"# Cancel-replace on {params.symbol}",
-            "",
-            f"- **cancelResult**: {data.get('cancelResult', 'N/A')}",
-            f"- **newOrderResult**: {data.get('newOrderResult', 'N/A')}",
-        ]
-        cancel_response = data.get("cancelResponse")
-        if isinstance(cancel_response, dict):
-            lines.append("")
-            lines.append("## Cancelled order")
-            lines.append("")
-            detail = _order_detail_lines(cancel_response)
-            lines.extend(detail if detail else [f"```json\n{to_json(cancel_response)}\n```"])
-        new_response = data.get("newOrderResponse")
-        if isinstance(new_response, dict):
-            lines.append("")
-            lines.append("## New order")
-            lines.append("")
-            detail = _order_detail_lines(new_response)
-            if detail:
-                lines.extend(detail)
-                fills = new_response.get("fills")
-                if isinstance(fills, list):
-                    lines.extend(_fills_lines(fills))
-            else:
-                lines.append(f"```json\n{to_json(new_response)}\n```")
+        lines = [f"# Cancel-replace on {params.symbol}", ""]
+        lines.extend(_cancel_replace_lines(data))
         if data.get("newOrderResult") != "SUCCESS":
             lines.append("")
             lines.append(
                 "_The replacement is NOT live. When cancelResult is SUCCESS the old order is gone either "
                 "way — decide deliberately before placing anything else._"
             )
+        return clip_response("\n".join(lines))
+    except httpx.HTTPStatusError as exc:
+        # 409 = the cancel succeeded and the replacement failed. The generic handler says
+        # so in one line, but the caller also needs to see WHICH order was cancelled —
+        # that detail is in the error body's `data`, so it is rendered here too.
+        if exc.response.status_code != 409:
+            return handle_api_error(exc)
+        try:
+            body = exc.response.json()
+        except ValueError:
+            return handle_api_error(exc)
+        lines = [handle_api_error(exc), ""]
+        payload = body.get("data") if isinstance(body, dict) else None
+        if isinstance(payload, dict):
+            lines.extend(_cancel_replace_lines(payload))
+        lines.append("")
+        lines.append(
+            "_The replacement is NOT live. Read cancelResult above: when it is SUCCESS the order shown "
+            "under 'Cancelled order' is gone and nothing replaced it — re-place deliberately._"
+        )
         return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
