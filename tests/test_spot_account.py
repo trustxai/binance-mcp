@@ -8,6 +8,7 @@ credentials.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -222,6 +223,23 @@ async def test_spot_account_json_format(monkeypatch: pytest.MonkeyPatch) -> None
     assert '"asset": "BTC"' in result
     assert '"hiddenZeroBalances": 1' in result
     assert '"asset": "USDT"' not in result
+    parsed = json.loads(result)
+    assert parsed["truncated"] is False
+    assert parsed["balancesShown"] == 2
+    assert parsed["balancesMatched"] == 2
+
+
+async def test_spot_account_json_format_truncation_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    balances = [{"asset": f"A{i}", "free": "1.00000000", "locked": "0.00000000"} for i in range(60)]
+    fake = _FakeClient(routes={"/api/v3/account": {**ACCOUNT_DATA, "balances": balances}})
+    monkeypatch.setattr("binance_mcp.tools.spot_account.get_client", lambda: fake)
+
+    result = await binance_get_spot_account(_SpotAccountInput(response_format=ResponseFormat.JSON))
+
+    parsed = json.loads(result)
+    assert parsed["truncated"] is True
+    assert parsed["balancesShown"] == 50
+    assert parsed["balancesMatched"] == 60
 
 
 async def test_spot_account_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,6 +378,7 @@ async def test_prevented_matches_by_prevented_match_id(monkeypatch: pytest.Monke
     result = await binance_get_prevented_matches(_PreventedMatchesInput(symbol="btcusdt", prevented_match_id=1))
 
     assert "match `1`" in result
+    assert "trade group `1`" in result
     assert "taker order `5`" in result
     assert "maker order `3`" in result
     assert "price 1.1" in result
@@ -369,6 +388,17 @@ async def test_prevented_matches_by_prevented_match_id(monkeypatch: pytest.Monke
     assert call[0] == "GET"
     assert call[1] == "/api/v3/myPreventedMatches"
     assert call[2] == {"params": {"symbol": "BTCUSDT", "preventedMatchId": 1}, "auth": "signed"}
+
+
+async def test_prevented_matches_by_order_id_alone_omits_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(routes={"/api/v3/myPreventedMatches": []})
+    monkeypatch.setattr("binance_mcp.tools.spot_account.get_client", lambda: fake)
+
+    result = await binance_get_prevented_matches(_PreventedMatchesInput(symbol="BTCUSDT", order_id=42))
+
+    assert "_No prevented matches found._" in result
+    call = fake.calls[0]
+    assert call[2] == {"params": {"symbol": "BTCUSDT", "orderId": 42}, "auth": "signed"}
 
 
 async def test_prevented_matches_by_order_id_with_limit_and_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -409,6 +439,27 @@ async def test_prevented_matches_json_format(monkeypatch: pytest.MonkeyPatch) ->
     )
 
     assert '"preventedMatchId": 1' in result
+    parsed = json.loads(result)
+    assert parsed["count"] == 1
+    assert parsed["truncated"] is False
+    assert parsed["displayLimit"] == 50
+    assert parsed["items"][0]["preventedMatchId"] == 1
+
+
+async def test_prevented_matches_json_format_truncation_stays_valid_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [{**PREVENTED_MATCH_ROW, "preventedMatchId": i} for i in range(60)]
+    fake = _FakeClient(routes={"/api/v3/myPreventedMatches": rows})
+    monkeypatch.setattr("binance_mcp.tools.spot_account.get_client", lambda: fake)
+
+    result = await binance_get_prevented_matches(
+        _PreventedMatchesInput(symbol="BTCUSDT", order_id=1, limit=1000, response_format=ResponseFormat.JSON)
+    )
+
+    parsed = json.loads(result)
+    assert parsed["count"] == 60
+    assert parsed["truncated"] is True
+    assert parsed["displayLimit"] == 50
+    assert len(parsed["items"]) == 50
 
 
 async def test_prevented_matches_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -525,6 +576,27 @@ async def test_allocations_json_format(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await binance_get_allocations(_AllocationsInput(symbol="BTCUSDT", response_format=ResponseFormat.JSON))
 
     assert '"allocationId": 0' in result
+    parsed = json.loads(result)
+    assert parsed["count"] == 1
+    assert parsed["truncated"] is False
+    assert parsed["displayLimit"] == 50
+    assert parsed["items"][0]["allocationId"] == 0
+
+
+async def test_allocations_json_format_truncation_stays_valid_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [{**ALLOCATION_ROW, "allocationId": i} for i in range(60)]
+    fake = _FakeClient(routes={"/api/v3/myAllocations": rows})
+    monkeypatch.setattr("binance_mcp.tools.spot_account.get_client", lambda: fake)
+
+    result = await binance_get_allocations(
+        _AllocationsInput(symbol="BTCUSDT", limit=1000, response_format=ResponseFormat.JSON)
+    )
+
+    parsed = json.loads(result)
+    assert parsed["count"] == 60
+    assert parsed["truncated"] is True
+    assert parsed["displayLimit"] == 50
+    assert len(parsed["items"]) == 50
 
 
 async def test_allocations_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -565,7 +637,7 @@ async def test_order_rate_limits_live_smoke() -> None:
 
 @pytest.mark.live
 async def test_prevented_matches_live_smoke() -> None:
-    result = await binance_get_prevented_matches(_PreventedMatchesInput(symbol="BTCUSDT", prevented_match_id=1))
+    result = await binance_get_prevented_matches(_PreventedMatchesInput(symbol="BTCUSDT", order_id=1))
     assert not result.startswith("Error")
 
 

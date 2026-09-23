@@ -106,9 +106,10 @@ def _format_rate_limit(row: dict[str, Any]) -> str:
 
 def _format_prevented_match(row: dict[str, Any]) -> str:
     return (
-        f"- match `{row.get('preventedMatchId', '?')}` — taker order `{row.get('takerOrderId', '?')}` vs "
-        f"maker order `{row.get('makerOrderId', '?')}` ({row.get('makerSymbol', '?')}), "
-        f"price {fmt_num(row.get('price'))}, maker qty prevented {fmt_num(row.get('makerPreventedQuantity'))}, "
+        f"- match `{row.get('preventedMatchId', '?')}` (trade group `{row.get('tradeGroupId', '?')}`) — "
+        f"taker order `{row.get('takerOrderId', '?')}` vs maker order `{row.get('makerOrderId', '?')}` "
+        f"({row.get('makerSymbol', '?')}), price {fmt_num(row.get('price'))}, "
+        f"maker qty prevented {fmt_num(row.get('makerPreventedQuantity'))}, "
         f"STP mode {row.get('selfTradePreventionMode', '?')}, at {epoch_to_human(row.get('transactTime'))}"
     )
 
@@ -137,6 +138,7 @@ class _SpotAccountInput(BaseModel):
     )
     asset: str | None = Field(
         default=None,
+        min_length=1,
         pattern=_ASSET_PATTERN,
         description=(
             "Show only this asset's balance, e.g. USDT (returned even if zero, overriding "
@@ -278,7 +280,9 @@ async def binance_get_spot_account(params: _SpotAccountInput) -> str:
     seller via fmt_num), permissions, last update time, and the balances list
     (free/locked via fmt_num). When `omit_zero_balances` is True (the default)
     and no `asset` filter is given, a count of hidden zero-balance assets is
-    shown. Display is capped at `MAX_DISPLAY_ROWS` (50) with a truncation note.
+    shown. Display is capped at `MAX_DISPLAY_ROWS` (50) with a truncation note;
+    JSON mode instead adds `truncated`/`balancesShown`/`balancesMatched` fields
+    so truncation is machine-readable too.
 
     Examples:
     params = {}
@@ -294,7 +298,7 @@ async def binance_get_spot_account(params: _SpotAccountInput) -> str:
         client = get_client()
         resp = await client.request("GET", "/api/v3/account", auth="signed")
         data = resp.json()
-        balances: list[dict[str, Any]] = data.get("balances", [])
+        balances: list[dict[str, Any]] = data.get("balances") or []
         hidden_zero = 0
         if params.asset:
             balances = [b for b in balances if str(b.get("asset", "")).upper() == params.asset]
@@ -306,15 +310,28 @@ async def binance_get_spot_account(params: _SpotAccountInput) -> str:
                 else:
                     kept.append(row)
             balances = kept
+        balances_matched = len(balances)
+        truncated = balances_matched > MAX_DISPLAY_ROWS
         truncated_note = None
-        if len(balances) > MAX_DISPLAY_ROWS:
+        if truncated:
             truncated_note = (
-                f"_[display truncated: {len(balances)} balances matched, showing the first "
+                f"_[display truncated: {balances_matched} balances matched, showing the first "
                 f"{MAX_DISPLAY_ROWS} — narrow with `asset` to see a specific one]_"
             )
             balances = balances[:MAX_DISPLAY_ROWS]
         if params.response_format is ResponseFormat.JSON:
-            return clip_response(to_json({**data, "balances": balances, "hiddenZeroBalances": hidden_zero}))
+            return clip_response(
+                to_json(
+                    {
+                        **data,
+                        "balances": balances,
+                        "hiddenZeroBalances": hidden_zero,
+                        "truncated": truncated,
+                        "balancesShown": len(balances),
+                        "balancesMatched": balances_matched,
+                    }
+                )
+            )
         commission = data.get("commissionRates") or {}
         hidden_note = f", {hidden_zero} zero-balance asset(s) hidden" if hidden_zero else ""
         lines = [
@@ -326,7 +343,7 @@ async def binance_get_spot_account(params: _SpotAccountInput) -> str:
             f"- **commission rates** — maker {fmt_num(commission.get('maker'))}, "
             f"taker {fmt_num(commission.get('taker'))}, buyer {fmt_num(commission.get('buyer'))}, "
             f"seller {fmt_num(commission.get('seller'))}",
-            f"- **permissions**: {', '.join(data.get('permissions', [])) or '?'}",
+            f"- **permissions**: {', '.join(data.get('permissions') or []) or '?'}",
             f"- **updated**: {epoch_to_human(data.get('updateTime'))}",
             "",
             f"## Balances — {len(balances)} shown{hidden_note}",
@@ -479,10 +496,20 @@ async def binance_get_prevented_matches(params: _PreventedMatchesInput) -> str:
     - For orders that DID execute — use `binance_get_my_trades` (trade history).
 
     Returns:
-    A markdown list (or JSON) of prevented matches: preventedMatchId, taker/maker
-    order ids, maker symbol, price, maker quantity prevented (via fmt_num), the
-    self-trade-prevention mode, and the transaction time. Display is capped at
-    `MAX_DISPLAY_ROWS` (50).
+    A markdown list (or JSON) of prevented matches: preventedMatchId,
+    tradeGroupId, taker/maker order ids, maker symbol, price, maker quantity
+    prevented (via fmt_num), the self-trade-prevention mode, and the
+    transaction time. Display is capped at `MAX_DISPLAY_ROWS` (50); JSON mode
+    returns `{count, truncated, displayLimit, items}` rather than a bare array,
+    so truncation stays valid JSON.
+
+    Pagination:
+    Only valid together with `order_id`: `from_prevented_match_id` is an
+    inclusive cursor — pass the last-seen `preventedMatchId` (or one past it)
+    to page forward, and `limit` (only sent when `from_prevented_match_id` is
+    set; Binance default 500, max 1000) caps how many rows come back per call.
+    Display is additionally capped at `MAX_DISPLAY_ROWS` (50) regardless of
+    `limit`.
 
     Examples:
     params = {"symbol": "BTCUSDT", "prevented_match_id": 1}
@@ -500,21 +527,24 @@ async def binance_get_prevented_matches(params: _PreventedMatchesInput) -> str:
             "preventedMatchId": params.prevented_match_id,
             "orderId": params.order_id,
             "fromPreventedMatchId": params.from_prevented_match_id,
-            "limit": params.limit if params.order_id is not None else None,
+            "limit": params.limit if params.from_prevented_match_id is not None else None,
         }
         query = {key: value for key, value in raw_query.items() if value is not None}
         resp = await client.request("GET", "/api/v3/myPreventedMatches", params=query, auth="signed")
         rows: list[dict[str, Any]] = resp.json()
+        total_count = len(rows)
+        truncated = total_count > MAX_DISPLAY_ROWS
         truncated_note = None
-        if len(rows) > MAX_DISPLAY_ROWS:
+        if truncated:
             truncated_note = (
-                f"_[display truncated: {len(rows)} rows returned, showing the first {MAX_DISPLAY_ROWS} — "
+                f"_[display truncated: {total_count} rows returned, showing the first {MAX_DISPLAY_ROWS} — "
                 "narrow with `order_id`/`from_prevented_match_id` to see the rest]_"
             )
             rows = rows[:MAX_DISPLAY_ROWS]
         if params.response_format is ResponseFormat.JSON:
-            body = to_json(rows)
-            return clip_response(f"{body}\n\n{truncated_note}" if truncated_note else body)
+            return clip_response(
+                to_json({"count": total_count, "truncated": truncated, "displayLimit": MAX_DISPLAY_ROWS, "items": rows})
+            )
         lines = [f"# Prevented Matches — {params.symbol}", ""]
         if rows:
             lines.extend(_format_prevented_match(row) for row in rows)
@@ -556,7 +586,8 @@ async def binance_get_allocations(params: _AllocationsInput) -> str:
     A markdown list (or JSON) of allocations: allocationId, orderId/orderListId,
     symbol, side (isBuyer), qty/price/quoteQty (via fmt_num), commission +
     commissionAsset, maker/allocator flags, and time. Display is capped at
-    `MAX_DISPLAY_ROWS` (50).
+    `MAX_DISPLAY_ROWS` (50); JSON mode returns `{count, truncated, displayLimit,
+    items}` rather than a bare array, so truncation stays valid JSON.
 
     Windows:
     `start_time`/`end_time` (epoch ms or ISO-8601) accept a span of at most 24 h
@@ -599,16 +630,19 @@ async def binance_get_allocations(params: _AllocationsInput) -> str:
         query = {key: value for key, value in raw_query.items() if value is not None}
         resp = await client.request("GET", "/api/v3/myAllocations", params=query, auth="signed")
         rows: list[dict[str, Any]] = resp.json()
+        total_count = len(rows)
+        truncated = total_count > MAX_DISPLAY_ROWS
         truncated_note = None
-        if len(rows) > MAX_DISPLAY_ROWS:
+        if truncated:
             truncated_note = (
-                f"_[display truncated: {len(rows)} rows returned, showing the first {MAX_DISPLAY_ROWS} — "
+                f"_[display truncated: {total_count} rows returned, showing the first {MAX_DISPLAY_ROWS} — "
                 "narrow the window or lower `limit` to see the rest]_"
             )
             rows = rows[:MAX_DISPLAY_ROWS]
         if params.response_format is ResponseFormat.JSON:
-            body = to_json(rows)
-            return clip_response(f"{body}\n\n{truncated_note}" if truncated_note else body)
+            return clip_response(
+                to_json({"count": total_count, "truncated": truncated, "displayLimit": MAX_DISPLAY_ROWS, "items": rows})
+            )
         lines = [f"# Allocations — {params.symbol}", ""]
         if rows:
             lines.extend(_format_allocation(row) for row in rows)
