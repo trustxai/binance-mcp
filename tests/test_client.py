@@ -22,6 +22,7 @@ from binance_mcp.client import (
     BinanceClient,
     BinanceEnvelopeError,
     ForbiddenEndpointError,
+    Repeat,
     TradingDisabledError,
     build_query,
     is_fund_moving,
@@ -337,6 +338,11 @@ def test_build_query_encodes_bools_lists_and_drops_none() -> None:
         {"symbols": ["BTCUSDT", "ETHUSDT"], "isIsolated": True, "limit": None, "recvWindow": 5000, "price": 0.1}
     )
     assert query == "symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%5D&isIsolated=true&recvWindow=5000&price=0.1"
+
+
+def test_build_query_repeat_marker_expands_to_repeated_keys() -> None:
+    query = build_query({"asset": Repeat(["BTC", "ETH", None]), "accountType": "SPOT"})
+    assert query == "asset=BTC&asset=ETH&accountType=SPOT"
 
 
 def test_build_query_empty() -> None:

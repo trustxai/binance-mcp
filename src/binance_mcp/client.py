@@ -83,6 +83,11 @@ class ForbiddenEndpointError(RuntimeError):
     """Raised for an endpoint this server refuses to call under any configuration."""
 
 
+class Repeat(list[Any]):
+    """Marker for a parameter Binance wants REPEATED (`asset=BTC&asset=ETH`, e.g. dust
+    conversion) rather than JSON-encoded like `symbols=["BTCUSDT","ETHUSDT"]`."""
+
+
 def _encode_value(value: Any) -> str:
     """Render one query value the way Binance expects it."""
     if isinstance(value, bool):
@@ -97,8 +102,15 @@ def build_query(params: dict[str, Any] | None) -> str:
     """Build the exact query string that is both signed and sent (None values dropped)."""
     if not params:
         return ""
-    clean = {key: _encode_value(value) for key, value in params.items() if value is not None}
-    return urlencode(clean)
+    pairs: list[tuple[str, str]] = []
+    for key, value in params.items():
+        if value is None:
+            continue
+        if isinstance(value, Repeat):
+            pairs.extend((key, _encode_value(item)) for item in value if item is not None)
+        else:
+            pairs.append((key, _encode_value(value)))
+    return urlencode(pairs)
 
 
 def is_fund_moving(method: str, path: str) -> bool:
