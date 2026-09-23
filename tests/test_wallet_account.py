@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -227,7 +228,7 @@ async def test_account_snapshot_happy_path_hides_zero_balances(monkeypatch: pyte
             "/sapi/v1/accountSnapshot",
             {
                 "auth": "signed",
-                "params": {"type": "SPOT", "startTime": None, "endTime": None, "limit": 7},
+                "params": {"type": "SPOT", "limit": 7},
             },
         )
     ]
@@ -267,6 +268,40 @@ async def test_account_snapshot_end_before_start_rejected_locally(monkeypatch: p
     assert fake.calls == []
 
 
+async def test_account_snapshot_only_start_time_defaults_end_to_now_and_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No end_time given: it defaults to now, and the span (start..now) is still checked."""
+    fake = _FakeClient()
+    monkeypatch.setattr("binance_mcp.tools.wallet_account.get_client", lambda: fake)
+
+    result = await binance_get_account_snapshot(AccountSnapshotInput(type=SnapshotType.SPOT, start_time=0))
+
+    assert result.startswith("Error")
+    assert "30 days" in result
+    assert fake.calls == []
+
+
+async def test_account_snapshot_start_time_older_than_retention_rejected_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A narrow (< 30 day) window that is entirely older than Binance's ~30-day retention."""
+    fake = _FakeClient()
+    monkeypatch.setattr("binance_mcp.tools.wallet_account.get_client", lambda: fake)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    day_ms = 24 * 60 * 60 * 1000
+    start_time = now_ms - 60 * day_ms
+    end_time = now_ms - 55 * day_ms  # 5-day span, well under 30 — but both endpoints are ancient
+
+    result = await binance_get_account_snapshot(
+        AccountSnapshotInput(type=SnapshotType.SPOT, start_time=start_time, end_time=end_time)
+    )
+
+    assert result.startswith("Error")
+    assert "30 days" in result
+    assert fake.calls == []
+
+
 async def test_account_snapshot_accepts_iso_dates(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(routes={"/sapi/v1/accountSnapshot": {"code": 200, "msg": "", "snapshotVos": []}})
     monkeypatch.setattr("binance_mcp.tools.wallet_account.get_client", lambda: fake)
@@ -276,8 +311,72 @@ async def test_account_snapshot_accepts_iso_dates(monkeypatch: pytest.MonkeyPatc
     )
 
     sent_params = fake.calls[0][2]["params"]
-    assert sent_params["startTime"] == 1788220800000
-    assert sent_params["endTime"] == 1788998400000
+    assert sent_params == {"type": "SPOT", "limit": 7, "startTime": 1788220800000, "endTime": 1788998400000}
+
+
+async def test_account_snapshot_numeric_string_ge_12_digits_is_epoch_ms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A >=12-digit numeric string is treated as an epoch-ms int, not parsed as ISO."""
+    fake = _FakeClient(routes={"/sapi/v1/accountSnapshot": {"code": 200, "msg": "", "snapshotVos": []}})
+    monkeypatch.setattr("binance_mcp.tools.wallet_account.get_client", lambda: fake)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    recent_ms = now_ms - 5 * 24 * 60 * 60 * 1000
+    assert len(str(recent_ms)) >= 12
+
+    await binance_get_account_snapshot(AccountSnapshotInput(type=SnapshotType.SPOT, start_time=str(recent_ms)))
+
+    assert fake.calls[0][2]["params"]["startTime"] == recent_ms
+
+
+async def test_account_snapshot_invalid_start_time_returns_named_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient()
+    monkeypatch.setattr("binance_mcp.tools.wallet_account.get_client", lambda: fake)
+
+    result = await binance_get_account_snapshot(AccountSnapshotInput(type=SnapshotType.SPOT, start_time="not-a-date"))
+
+    assert result.startswith("Error: start_time must be")
+    assert fake.calls == []
+
+
+async def test_account_snapshot_error_code_in_200_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """accountSnapshot answers HTTP 200 with {code, msg, snapshotVos} on failure — no
+    `success` key, so the client's envelope check never fires; the tool must check
+    `code` itself."""
+    fake = _FakeClient(routes={"/sapi/v1/accountSnapshot": {"code": -1000, "msg": "An unknown error occurred."}})
+    monkeypatch.setattr("binance_mcp.tools.wallet_account.get_client", lambda: fake)
+
+    result = await binance_get_account_snapshot(AccountSnapshotInput(type=SnapshotType.SPOT))
+
+    assert result == "Error: An unknown error occurred. (code -1000)"
+
+
+async def test_account_snapshot_balances_sorted_desc_and_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # free = i + 1 (never zero) so all 60 rows survive the zero-balance filter; only the
+    # display cap trims them.
+    balances = [{"asset": f"COIN{i}", "free": str(i + 1), "locked": "0"} for i in range(60)]
+    fake = _FakeClient(
+        routes={
+            "/sapi/v1/accountSnapshot": {
+                "code": 200,
+                "msg": "",
+                "snapshotVos": [
+                    {
+                        "type": "spot",
+                        "updateTime": 1698000000000,
+                        "data": {"totalAssetOfBtc": "1", "balances": balances},
+                    }
+                ],
+            }
+        }
+    )
+    monkeypatch.setattr("binance_mcp.tools.wallet_account.get_client", lambda: fake)
+
+    result = await binance_get_account_snapshot(AccountSnapshotInput(type=SnapshotType.SPOT))
+
+    # largest balance (COIN59, free=60) sorts first; smallest 10 (COIN0..COIN9) are capped out.
+    assert "| COIN59 | 60 | 0 |" in result
+    assert "COIN0 |" not in result
+    assert "10 more asset(s) not shown" in result
+    assert result.index("COIN59") < result.index("COIN58")
 
 
 # -- binance_get_system_status --------------------------------------------------------

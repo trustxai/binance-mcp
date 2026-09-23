@@ -10,6 +10,7 @@ served there).
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 
@@ -30,21 +31,39 @@ MAX_DISPLAY_ROWS = 50
 _SNAPSHOT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
 
-def _to_ms(value: int | str | None) -> int | None:
-    """Accept an epoch-ms int or an ISO-8601 string on the tool surface; send ms."""
+def _to_ms(value: int | str | None, field: str) -> int | None:
+    """Accept an epoch-ms int or an ISO-8601 string on the tool surface; send ms.
+
+    A numeric string is only treated as an epoch-ms integer when it has at least 12
+    digits (a real ms timestamp is 13 digits today); anything shorter is almost
+    certainly a malformed date and is parsed as ISO-8601 instead, so a typo surfaces
+    a clear error rather than silently becoming a bogus timestamp.
+    """
     if value is None:
         return None
     if isinstance(value, int):
         return value
     text = value.strip()
-    try:
+    if text.isdigit() and len(text) >= 12:
         return int(text)
-    except ValueError:
-        pass
-    dt = datetime.fromisoformat(text)
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{field} must be an epoch-ms integer (>= 12 digits) or an ISO-8601 date/datetime "
+            f"(e.g. '2026-09-01' or '2026-09-01T00:00:00Z'); got {value!r}."
+        ) from exc
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return int(dt.timestamp() * 1000)
+
+
+def _decimal(value: Any) -> Decimal:
+    """Safe Decimal parse for zero-filtering/sorting; malformed values count as zero."""
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return Decimal(0)
 
 
 def _format_restrictions(data: dict[str, Any]) -> list[str]:
@@ -184,7 +203,7 @@ async def binance_get_account_status(params: AccountStatusInput) -> str:
         if params.response_format is ResponseFormat.JSON:
             return clip_response(to_json(data))
         status = data.get("data", "Unknown")
-        return f"# Binance account status\n\n- **status**: {status}"
+        return clip_response(f"# Binance account status\n\n- **status**: {status}")
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -245,7 +264,7 @@ async def binance_get_api_trading_status(params: ApiTradingStatusInput) -> str:
             f"  - IFER (IOC/FOK expiration ratio): {trigger.get('IFER', 'N/A')}",
             f"  - UFR (unfilled ratio): {trigger.get('UFR', 'N/A')}",
         ]
-        return "\n".join(lines)
+        return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -295,7 +314,7 @@ async def binance_get_api_restrictions(params: ApiRestrictionsInput) -> str:
             return clip_response(to_json(data))
         lines = ["# Binance API key restrictions", ""]
         lines.extend(_format_restrictions(data))
-        return "\n".join(lines)
+        return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -349,7 +368,7 @@ async def binance_get_account_info(params: AccountInfoInput) -> str:
             f"- **options enabled**: {bool(data.get('isOptionsEnabled'))}",
             f"- **portfolio margin (retail) enabled**: {bool(data.get('isPortfolioMarginRetailEnabled'))}",
         ]
-        return "\n".join(lines)
+        return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -382,56 +401,70 @@ async def binance_get_account_snapshot(params: AccountSnapshotInput) -> str:
       which is far cheaper (IP weight 20) and reflects right now, not yesterday.
 
     Returns:
-    A markdown block per snapshot day (UTC date, totalAssetOfBtc, and each non-zero
-    balance as a table), or raw JSON with `response_format="json"`.
+    A markdown block per snapshot day (UTC date, totalAssetOfBtc, and a table of
+    non-zero balances sorted largest-first, capped at 50 rows per day), or raw JSON
+    with `response_format="json"`.
 
     Windows:
     `start_time`/`end_time` (int ms or ISO-8601) together must span less than 30 days;
-    omit both to get the most recent `limit` days. `limit` is 7-30 (Binance default 7).
+    with only `start_time` given, `end_time` defaults to now and the same 30-day span
+    check applies. Either way, `start_time` itself must be within the last 30 days —
+    Binance does not retain snapshots older than that, regardless of window width.
+    Omit both to get the most recent `limit` days. `limit` is 7-30 (Binance default 7).
 
     Examples:
         params = {"type": "SPOT"}
         params = {"type": "SPOT", "start_time": "2026-09-01", "end_time": "2026-09-10", "limit": 10}
 
     Error Handling:
-    A window of 30 days or more is rejected locally instead of round-tripping to
-    Binance's "Support query within the last one month only". -2015 means the key
-    lacks Reading permission or this IP is not allowlisted.
+    A window of 30 days or more, or a `start_time` more than 30 days ago, is rejected
+    locally instead of round-tripping to Binance's "Support query within the last one
+    month only". This endpoint answers HTTP 200 with `{code, msg, snapshotVos}` on
+    failure (no `success` field, so the client's envelope check does not catch it) — a
+    non-200 `code` is surfaced as an `Error:` here. -2015 means the key lacks Reading
+    permission or this IP is not allowlisted.
     """
     try:
-        start_ms = _to_ms(params.start_time)
-        end_ms = _to_ms(params.end_time)
-        if start_ms is not None and end_ms is not None:
-            if end_ms <= start_ms:
+        start_ms = _to_ms(params.start_time, "start_time")
+        end_ms = _to_ms(params.end_time, "end_time")
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        if start_ms is not None:
+            effective_end_ms = end_ms if end_ms is not None else now_ms
+            if effective_end_ms <= start_ms:
                 return "Error: end_time must be after start_time."
-            if end_ms - start_ms >= _SNAPSHOT_WINDOW_MS:
-                days = (end_ms - start_ms) / (24 * 60 * 60 * 1000)
+            if effective_end_ms - start_ms >= _SNAPSHOT_WINDOW_MS:
+                days = (effective_end_ms - start_ms) / (24 * 60 * 60 * 1000)
                 return (
                     f"Error: the start_time/end_time window spans ~{days:.1f} days; Binance's "
                     "accountSnapshot only supports windows under 30 days (and only the last "
                     "month of history). Narrow the window."
                 )
+            if now_ms - start_ms >= _SNAPSHOT_WINDOW_MS:
+                days_ago = (now_ms - start_ms) / (24 * 60 * 60 * 1000)
+                return (
+                    f"Error: start_time is ~{days_ago:.1f} days in the past; Binance's accountSnapshot "
+                    "only retains the last 30 days of history, regardless of window width. Use a more "
+                    "recent start_time."
+                )
+        query_params: dict[str, Any] = {"type": params.type.value, "limit": params.limit}
+        if start_ms is not None:
+            query_params["startTime"] = start_ms
+        if end_ms is not None:
+            query_params["endTime"] = end_ms
         client = get_client()
-        resp = await client.request(
-            "GET",
-            "/sapi/v1/accountSnapshot",
-            auth="signed",
-            params={
-                "type": params.type.value,
-                "startTime": start_ms,
-                "endTime": end_ms,
-                "limit": params.limit,
-            },
-        )
+        resp = await client.request("GET", "/sapi/v1/accountSnapshot", auth="signed", params=query_params)
         data = resp.json()
+        code = data.get("code")
+        if code not in (None, 200):
+            return f"Error: {data.get('msg')} (code {code})"
         if params.response_format is ResponseFormat.JSON:
             return clip_response(to_json(data))
         snapshots = data.get("snapshotVos") or []
         lines = [f"# Binance {params.type.value} account snapshot", ""]
         if not snapshots:
             lines.append("_No snapshots in range._")
-            return "\n".join(lines)
-        for snap in snapshots[:MAX_DISPLAY_ROWS]:
+            return clip_response("\n".join(lines))
+        for snap in snapshots:
             day_data = snap.get("data", {})
             lines.append(f"## {epoch_to_human(snap.get('updateTime'))}")
             total_btc = day_data.get("totalAssetOfBtc")
@@ -440,18 +473,19 @@ async def binance_get_account_snapshot(params: AccountSnapshotInput) -> str:
             balances = [
                 b
                 for b in day_data.get("balances", [])
-                if float(b.get("free") or 0) != 0 or float(b.get("locked") or 0) != 0
+                if _decimal(b.get("free")) != 0 or _decimal(b.get("locked")) != 0
             ]
+            balances.sort(key=lambda b: _decimal(b.get("free")) + _decimal(b.get("locked")), reverse=True)
             if balances:
                 lines.append("| asset | free | locked |")
                 lines.append("|---|---|---|")
-                for bal in balances:
+                for bal in balances[:MAX_DISPLAY_ROWS]:
                     lines.append(f"| {bal.get('asset')} | {fmt_num(bal.get('free'))} | {fmt_num(bal.get('locked'))} |")
+                if len(balances) > MAX_DISPLAY_ROWS:
+                    lines.append(f"_[{len(balances) - MAX_DISPLAY_ROWS} more asset(s) not shown]_")
             else:
                 lines.append("_all balances zero_")
             lines.append("")
-        if len(snapshots) > MAX_DISPLAY_ROWS:
-            lines.append(f"_[{len(snapshots) - MAX_DISPLAY_ROWS} more snapshot(s) not shown]_")
         return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
@@ -501,7 +535,7 @@ async def binance_get_system_status(params: SystemStatusInput) -> str:
         lines = ["# Binance system status", "", f"- **status**: {status_label}"]
         if data.get("msg"):
             lines.append(f"- **message**: {data['msg']}")
-        return "\n".join(lines)
+        return clip_response("\n".join(lines))
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -551,7 +585,7 @@ async def binance_get_delist_schedule(params: DelistScheduleInput) -> str:
         lines = ["# Binance delist schedule", ""]
         if not rows:
             lines.append("_No symbols currently scheduled for delisting._")
-            return "\n".join(lines)
+            return clip_response("\n".join(lines))
         lines.append("| delist time | symbols |")
         lines.append("|---|---|")
         for row in rows[:MAX_DISPLAY_ROWS]:
