@@ -15,6 +15,7 @@ None of these endpoints exist on the spot testnet (`/sapi` is not served there).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -33,7 +34,7 @@ from binance_mcp.server import mcp
 
 # Context-window guard (rule 8): markdown rows are capped here on top of the API limit;
 # the JSON format still carries the full set (through clip_response).
-MAX_DISPLAY_ROWS = 100
+MAX_DISPLAY_ROWS = 50
 
 # `config/getall` returns every listed coin (~400); cap the markdown rendering.
 MAX_COINS = 50
@@ -61,6 +62,9 @@ _PAGE_LIMIT = 1000
 BINANCE_LAUNCH = "2017-07-01"
 
 _WALLET_TYPES: dict[int, str] = {0: "spot", 1: "funding"}
+
+# Bare ASSET codes, not pairs: 1-20 chars, because `W` and `S` are real Binance assets.
+_ASSET_RE = re.compile(r"[A-Z0-9]{1,20}")
 
 
 class DepositStatus(StrEnum):
@@ -240,10 +244,15 @@ def _resolve_window(
 
 
 def _normalise_asset(value: str) -> str:
-    """Uppercase and check a bare ASSET code (`BTC`, and the real one-letter assets `W`/`S`)."""
+    """Uppercase and check a bare ASSET code (`BTC`, and the real one-letter assets `W`/`S`).
+
+    The pattern is deliberately ASCII-only: `str.isalnum()` accepts Unicode digits and
+    fullwidth letters ("\uff22\uff34\uff23", "\u0662"), which sail through to Binance and come
+    back as -1100 "illegal characters".
+    """
     upper = value.strip().upper()
-    if not upper or len(upper) > 20 or not upper.isalnum():
-        raise ValueError(f"asset code must be 1-20 alphanumeric characters (e.g. 'BTC'); got {value!r}")
+    if not _ASSET_RE.fullmatch(upper):
+        raise ValueError(f"asset code must be 1-20 ASCII letters/digits (e.g. 'BTC'); got {value!r}")
     return upper
 
 
@@ -287,7 +296,7 @@ def _deposit_row(row: dict[str, Any]) -> str:
 
 def _withdraw_row(row: dict[str, Any]) -> str:
     return (
-        f"| {epoch_to_human(row.get('applyTime'))} | {epoch_to_human(row.get('completeTime'))} "
+        f"| {epoch_to_human(_row_ms(row.get('applyTime')))} | {epoch_to_human(row.get('completeTime'))} "
         f"| {row.get('coin') or 'N/A'} | {fmt_num(row.get('amount'))} | {fmt_num(row.get('transactionFee'))} "
         f"| {row.get('network') or 'N/A'} | {_status_label(row.get('status'), _WITHDRAW_STATUS_NAMES)} "
         f"| {_wallet_label(row.get('walletType'))} | `{row.get('txId') or 'N/A'}` "
@@ -486,14 +495,32 @@ def _walk_response(
     since_ms: int,
     until_ms: int,
 ) -> str:
-    """Render a walk: rows newest-first, per-coin totals, and the resume cursor."""
+    """Render a walk: rows newest-first, per-coin totals, and the resume cursor.
+
+    The cursor is suppressed in one case, deliberately. If the walk stopped while still
+    inside the FIRST window, `resume_before` equals `until_ms` — handing that back would
+    issue a byte-identical request and return the identical cursor, forever. That is not
+    a resume, it is a loop, so the caller is told to raise `max_calls` (or clear the
+    error) and re-run the SAME range instead, and the JSON carries `no_progress: true`
+    with a null cursor so a programmatic caller cannot chain on it either.
+    """
     rows = sorted(result.rows, key=lambda r: _row_ms(r.get(time_key)), reverse=True)
     totals = _totals_by_coin(rows, with_fees=with_fees)
-    resume_note = None
-    if result.resume_before is not None:
-        resume_note = (
-            f"{result.note} Resume with `since={since_ms}`, `resume_before={result.resume_before}` "
-            f"({epoch_to_human(result.resume_before)}) to continue backwards from where this stopped."
+    stopped_early = result.resume_before is not None
+    no_progress = stopped_early and result.resume_before == until_ms
+    cursor = None if no_progress else result.resume_before
+
+    stop_note: str | None = None
+    if no_progress:
+        stop_note = (
+            f"{result.note} No window was completed, so this run made no forward progress: raise "
+            f"`max_calls` (or clear the error) and re-run with the same `since`/`until` — resuming "
+            f"with `resume_before={until_ms}` would repeat exactly these calls."
+        )
+    elif stopped_early:
+        stop_note = (
+            f"{result.note} Resume with `since={since_ms}`, `resume_before={cursor}` "
+            f"({epoch_to_human(cursor)}) to continue backwards from where this stopped."
         )
 
     if fmt is ResponseFormat.JSON:
@@ -501,10 +528,11 @@ def _walk_response(
             to_json(
                 {
                     "count": len(rows),
-                    "truncated": result.resume_before is not None,
+                    "truncated": stopped_early,
+                    "no_progress": no_progress,
                     "since": since_ms,
                     "until": until_ms,
-                    "resume_before": result.resume_before,
+                    "resume_before": cursor,
                     "calls_made": result.calls,
                     "totals": totals,
                     "items": rows,
@@ -519,8 +547,8 @@ def _walk_response(
         f"in **{result.calls}** API call(s).",
         "",
     ]
-    if resume_note:
-        lines.extend([f"> ⚠️ {resume_note}", ""])
+    if stop_note:
+        lines.extend([f"> ⚠️ {stop_note}", ""])
     else:
         lines.extend(["_Complete: the walk reached `since`._", ""])
     if not rows:
@@ -786,7 +814,7 @@ async def binance_get_deposit_history(params: DepositHistoryInput) -> str:
 
     Returns:
     A markdown table (insertTime, completeTime, coin, amount, network, status,
-    walletType, txId) plus per-coin totals, capped at 100 displayed rows; or the raw
+    walletType, txId) plus per-coin totals, capped at 50 displayed rows; or the raw
     Binance array with `response_format="json"`.
 
     Pagination:
@@ -883,7 +911,7 @@ async def binance_get_withdraw_history(params: WithdrawHistoryInput) -> str:
     Returns:
     A markdown table (applyTime, completeTime, coin, amount, transactionFee, network,
     status, walletType, txId, withdrawOrderId) plus per-coin totals including fees,
-    capped at 100 displayed rows; or the raw Binance array with
+    capped at 50 displayed rows; or the raw Binance array with
     `response_format="json"`.
 
     Pagination:
@@ -983,15 +1011,21 @@ async def binance_get_all_deposits(params: AllDepositsInput) -> str:
 
     Returns:
     Rows sorted newest-first with per-coin totals (count + summed amount). Markdown
-    displays at most 100 rows; `response_format="json"` returns
-    `{count, truncated, since, until, resume_before, calls_made, totals, items}` with
-    the full set. `truncated` is true exactly when the walk did not reach `since`.
+    displays at most 50 rows; `response_format="json"` returns
+    `{count, truncated, no_progress, since, until, resume_before, calls_made, totals,
+    items}` with the full set. `truncated` is true exactly when the walk did not reach
+    `since`; `no_progress` is true when it did not finish even the first window, and
+    then `resume_before` is null on purpose — see Pagination.
 
     Pagination:
     If the walk stops before `since` — budget exhausted, or an error — it returns the
     rows it already has PLUS `resume_before`, the boundary of the next UNFETCHED range.
     Call again with the same `since` and that `resume_before` to continue. A stop in
     the middle of a window re-fetches that window, which the dedupe makes harmless.
+    If it stopped without completing even the FIRST window there is no cursor to give:
+    `resume_before` comes back null with `no_progress: true`, because repeating the run
+    with `resume_before = until` would re-issue the identical calls forever. Raise
+    `max_calls` (or fix the error) and re-run the same range instead.
 
     Examples:
         params = {}
@@ -1074,15 +1108,19 @@ async def binance_get_all_withdrawals(params: AllWithdrawalsInput) -> str:
 
     Returns:
     Rows sorted newest-first with per-coin totals (count, summed amount, summed
-    `transactionFee`). Markdown displays at most 100 rows; `response_format="json"`
-    returns `{count, truncated, since, until, resume_before, calls_made, totals, items}`
-    with the full set. `truncated` is true exactly when the walk did not reach `since`.
+    `transactionFee`). Markdown displays at most 50 rows; `response_format="json"`
+    returns `{count, truncated, no_progress, since, until, resume_before, calls_made,
+    totals, items}` with the full set. `truncated` is true exactly when the walk did not
+    reach `since`; `no_progress` is true when it did not finish even the first window,
+    and then `resume_before` is null on purpose — see Pagination.
 
     Pagination:
     If the walk stops before `since` — which with `max_calls=10` is the normal case for
     a multi-year sweep — it returns the rows it has PLUS `resume_before`, the boundary
     of the next UNFETCHED range. Call again with the same `since` and that
-    `resume_before`; repeat until `truncated` is false.
+    `resume_before`; repeat until `truncated` is false. If not even the first window
+    completed, `resume_before` is null and `no_progress` is true: raise `max_calls` and
+    re-run the same range, since resuming at `until` would repeat the identical calls.
 
     Examples:
         params = {}

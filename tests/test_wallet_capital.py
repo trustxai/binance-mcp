@@ -8,6 +8,7 @@ taken from the loop's own `window_end`, never derived from the rows that came ba
 
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -315,7 +316,7 @@ async def test_deposit_history_display_cap(monkeypatch: pytest.MonkeyPatch) -> N
 
     result = await binance_get_deposit_history(DepositHistoryInput())
 
-    assert "30 more row(s) not shown" in result
+    assert "80 more row(s) not shown" in result  # MAX_DISPLAY_ROWS = 50
 
 
 # -- binance_get_withdraw_history ------------------------------------------------------
@@ -505,9 +506,12 @@ async def test_all_deposits_budget_exhausted_at_window_boundary(monkeypatch: pyt
     assert len(fake.calls) == 1
 
 
-async def test_all_deposits_budget_exhausted_mid_window_keeps_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stop inside a window points the cursor at THAT window's own end, so the
-    resume re-fetches it — safe because rows are deduped by id."""
+async def test_all_deposits_stop_inside_first_window_emits_no_progress_not_a_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stopping inside the FIRST window leaves `resume_before == until`, which is not a
+    resume but a loop: a chained call would re-issue the identical request and get the
+    identical cursor back forever. The cursor is suppressed and `no_progress` says so."""
     since = UNTIL - 200 * DAY
     fake = _WalkClient(queue=[[_deposit(i) for i in range(1000)]])
     monkeypatch.setattr(f"{MODULE}.get_client", lambda: fake)
@@ -519,8 +523,91 @@ async def test_all_deposits_budget_exhausted_mid_window_keeps_rows(monkeypatch: 
 
     assert payload["calls_made"] == 1
     assert payload["count"] == 1000  # partial rows preserved
-    assert payload["resume_before"] == UNTIL  # the window it was in the middle of
+    assert payload["truncated"] is True  # it really did not reach `since`
+    assert payload["no_progress"] is True
+    assert payload["resume_before"] is None  # nothing to chain on
     assert len(fake.calls) == 1
+
+
+async def test_all_deposits_mid_window_stop_after_a_completed_window_still_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard is scoped to "no window finished" — a mid-window stop that follows a
+    completed window still yields a usable cursor at that window's own end."""
+    since = UNTIL - 300 * DAY
+    fake = _WalkClient(queue=[[_deposit(1)], [_deposit(100 + i) for i in range(1000)]])
+    monkeypatch.setattr(f"{MODULE}.get_client", lambda: fake)
+
+    payload = _walk_json(
+        await binance_get_all_deposits(
+            AllDepositsInput(since=since, until=UNTIL, max_calls=2, response_format=ResponseFormat.JSON)
+        )
+    )
+
+    assert payload["no_progress"] is False
+    assert payload["resume_before"] == UNTIL - WINDOW  # window 2's own end: it is re-fetched
+    assert payload["count"] == 1001
+
+
+async def test_all_deposits_no_progress_markdown_refuses_to_offer_a_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The markdown must not print a "resume with ..." instruction that loops."""
+    since = UNTIL - 200 * DAY
+    fake = _WalkClient(queue=[[_deposit(i) for i in range(1000)]])
+    monkeypatch.setattr(f"{MODULE}.get_client", lambda: fake)
+
+    result = await binance_get_all_deposits(AllDepositsInput(since=since, until=UNTIL, max_calls=1))
+
+    assert "no forward progress" in result
+    assert "raise `max_calls`" in result
+    assert "Resume with" not in result
+
+
+async def test_all_deposits_no_progress_second_run_is_not_chained_blindly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loop this guard prevents, made explicit: with the cursor suppressed there is
+    nothing to feed back, and re-running with `resume_before = until` reproduces the
+    identical single call and the identical no-progress verdict."""
+    since = UNTIL - 200 * DAY
+
+    first = _WalkClient(queue=[[_deposit(i) for i in range(1000)]])
+    monkeypatch.setattr(f"{MODULE}.get_client", lambda: first)
+    run1 = _walk_json(
+        await binance_get_all_deposits(
+            AllDepositsInput(since=since, until=UNTIL, max_calls=1, response_format=ResponseFormat.JSON)
+        )
+    )
+    assert run1["resume_before"] is None, "a caller chaining on the cursor has nothing to chain"
+
+    # Chaining on `until` anyway (what the old code invited) makes zero progress:
+    second = _WalkClient(queue=[[_deposit(i) for i in range(1000)]])
+    monkeypatch.setattr(f"{MODULE}.get_client", lambda: second)
+    run2 = _walk_json(
+        await binance_get_all_deposits(
+            AllDepositsInput(since=since, resume_before=UNTIL, max_calls=1, response_format=ResponseFormat.JSON)
+        )
+    )
+
+    assert second.calls == first.calls, "byte-identical request: no forward progress"
+    assert run2["no_progress"] is True
+    assert run2["resume_before"] is None
+
+    # And the escape hatch the guard points at does work: a bigger budget moves on.
+    # 3 calls drain window 1 (a full page then a short one) and window 2 (empty), so the
+    # cursor lands two windows back and IS chainable.
+    third = _WalkClient(queue=[[_deposit(i) for i in range(1000)], [_deposit(9999)]])
+    monkeypatch.setattr(f"{MODULE}.get_client", lambda: third)
+    run3 = _walk_json(
+        await binance_get_all_deposits(
+            AllDepositsInput(since=since, until=UNTIL, max_calls=3, response_format=ResponseFormat.JSON)
+        )
+    )
+
+    assert run3["no_progress"] is False
+    assert run3["resume_before"] == UNTIL - 2 * WINDOW
+    assert run3["calls_made"] == 3
 
 
 async def test_all_deposits_budget_exhausted_markdown_mentions_resume(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -621,7 +708,8 @@ async def test_all_deposits_error_mid_walk_returns_partial_rows_and_cursor(
 
 
 async def test_all_deposits_auth_error_stops_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Auth is never tolerated: one request, no retry, cursor at the untouched `until`."""
+    """Auth is never tolerated: one request, no retry. It fails inside the first window,
+    so the no-progress guard fires instead of handing back an unusable cursor."""
     since = UNTIL - 200 * DAY
     fake = _WalkClient(
         queue=[_status_error(401, {"code": -2015, "msg": "Invalid API-key, IP, or permissions for action."})]
@@ -632,7 +720,8 @@ async def test_all_deposits_auth_error_stops_immediately(monkeypatch: pytest.Mon
 
     assert len(fake.calls) == 1
     assert "Error (401)" in result
-    assert f"`resume_before={UNTIL}`" in result
+    assert "no forward progress" in result
+    assert "Resume with" not in result
 
 
 async def test_all_deposits_span_error_is_tolerated_by_halving_the_window(
@@ -1045,12 +1134,20 @@ async def test_no_withdrawal_tool_is_exported() -> None:
         ]
     )
     # Nothing in this module issues a non-GET request: every path it touches is a read.
+    # Walked as an AST rather than grepped, so a `request(` split over lines, renamed,
+    # or built from a variable method cannot slip past a substring count.
     source = (module.__file__ or "").replace(".pyc", ".py")
     with open(source) as handle:
-        text = handle.read()
-    assert "client.request(" in text
-    assert 'client.request("GET"' in text
-    assert text.count("client.request(") == text.count('client.request("GET"')
+        tree = ast.parse(handle.read())
+    methods = [
+        node.args[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "request"
+    ]
+    assert methods, "expected at least one client.request(...) call to inspect"
+    for arg in methods:
+        assert isinstance(arg, ast.Constant), f"HTTP method must be a literal, got {ast.dump(arg)}"
+        assert arg.value == "GET", f"non-GET request in a read-only module: {arg.value!r}"
 
 
 # -- live smoke ------------------------------------------------------------------------
