@@ -150,6 +150,30 @@ def test_exchange_info_rejects_invalid_symbol() -> None:
         md.ExchangeInfoInput(symbol="B")
 
 
+async def test_exchange_info_falls_back_to_legacy_min_notional_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Some symbols still carry the legacy MIN_NOTIONAL filter instead of NOTIONAL."""
+    payload = {
+        "timezone": "UTC",
+        "serverTime": 1700000000000,
+        "symbols": [
+            {
+                "symbol": "BTCUSDT",
+                "status": "TRADING",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+                "orderTypes": ["LIMIT"],
+                "filters": [{"filterType": "MIN_NOTIONAL", "minNotional": "10.00000000", "applyToMarket": True}],
+            }
+        ],
+    }
+    fake = _FakeClient(payload=payload)
+    _patch_client(monkeypatch, fake)
+
+    result = await md.binance_get_exchange_info(md.ExchangeInfoInput(symbol="BTCUSDT"))
+
+    assert "NOTIONAL: min 10, applyToMarket True" in result
+
+
 # -- binance_get_order_book ----------------------------------------------------------
 
 ORDER_BOOK_PAYLOAD: dict[str, Any] = {
@@ -214,8 +238,9 @@ async def test_recent_trades_happy_path(monkeypatch: pytest.MonkeyPatch) -> None
     result = await md.binance_get_recent_trades(md.RecentTradesInput(symbol="btcusdt", limit=2))
 
     assert "Showing 2 of 2 trade(s)" in result
-    assert "maker-buy" in result
-    assert "taker-buy" in result
+    # id 1 isBuyerMaker=True -> the taker (aggressor) sold; id 2 isBuyerMaker=False -> bought.
+    assert "| 1 | 2023-11-14 22:13:20 UTC | 50000 | 0.01 | sell |" in result
+    assert "| 2 | 2023-11-14 22:13:21 UTC | 50001 | 0.02 | buy |" in result
     assert fake.calls == [("GET", "/api/v3/trades", {"params": {"symbol": "BTCUSDT", "limit": 2}, "auth": "none"})]
 
 
@@ -249,6 +274,8 @@ async def test_agg_trades_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await md.binance_get_agg_trades(md.AggTradesInput(symbol="btcusdt", from_id=5))
 
     assert "10-12" in result
+    # m=True -> the taker (aggressor) sold, same convention as binance_get_recent_trades.
+    assert "| sell |" in result
     assert fake.calls == [
         (
             "GET",
@@ -276,6 +303,15 @@ async def test_agg_trades_accepts_iso_timestamps(monkeypatch: pytest.MonkeyPatch
 def test_agg_trades_rejects_from_id_with_times() -> None:
     with pytest.raises(ValidationError):
         md.AggTradesInput(symbol="BTCUSDT", from_id=1, start_time=1700000000000)
+
+
+def test_agg_trades_start_time_schema_allows_string() -> None:
+    """A `mode="before"` validator normalises to ms but does not narrow the published
+    schema — start_time/end_time must still advertise ISO-8601 strings as accepted."""
+    schema = md.AggTradesInput.model_json_schema()
+    branch_types = {branch.get("type") for branch in schema["properties"]["start_time"]["anyOf"]}
+    assert "string" in branch_types
+    assert "integer" in branch_types
 
 
 # -- binance_get_klines / binance_get_ui_klines -----------------------------------------
@@ -354,6 +390,13 @@ async def test_klines_passes_start_end_time_zone(monkeypatch: pytest.MonkeyPatch
     assert "endTime" not in sent_params
 
 
+def test_klines_start_time_schema_allows_string() -> None:
+    schema = md.KlinesInput.model_json_schema()
+    branch_types = {branch.get("type") for branch in schema["properties"]["start_time"]["anyOf"]}
+    assert "string" in branch_types
+    assert "integer" in branch_types
+
+
 def test_ui_klines_input_is_subclass_of_klines_input() -> None:
     assert issubclass(md.UiKlinesInput, md.KlinesInput)
 
@@ -365,7 +408,13 @@ async def test_ui_klines_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await md.binance_get_ui_klines(md.UiKlinesInput(symbol="BTCUSDT", interval=md.KlineInterval.D1))
 
     assert "UI Klines — BTCUSDT (1d)" in result
-    assert fake.calls[0][1] == "/api/v3/uiKlines"
+    assert fake.calls == [
+        (
+            "GET",
+            "/api/v3/uiKlines",
+            {"params": {"symbol": "BTCUSDT", "interval": "1d", "limit": 500}, "auth": "none"},
+        )
+    ]
 
 
 # -- binance_get_avg_price -------------------------------------------------------------
@@ -383,6 +432,8 @@ async def test_avg_price_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # -- binance_get_ticker_24h ------------------------------------------------------------
 
+# Only /ticker/24hr FULL carries bidPrice/askPrice — rolling and tradingDay never do,
+# even at FULL (see TICKER_STATS_NO_BID_ASK below).
 TICKER_STATS_FULL: dict[str, Any] = {
     "symbol": "BTCUSDT",
     "priceChange": "100.00",
@@ -400,6 +451,24 @@ TICKER_STATS_FULL: dict[str, Any] = {
     "count": 12345,
 }
 
+# Realistic /ticker/tradingDay or /ticker (rolling) FULL payload: no bidPrice/askPrice.
+TICKER_STATS_NO_BID_ASK: dict[str, Any] = {
+    k: v for k, v in TICKER_STATS_FULL.items() if k not in ("bidPrice", "askPrice")
+}
+
+# Realistic MINI payload (any of the three endpoints): no priceChange/weightedAvgPrice/bid/ask.
+TICKER_STATS_MINI: dict[str, Any] = {
+    "symbol": "BTCUSDT",
+    "openPrice": "50000.00",
+    "highPrice": "50200.00",
+    "lowPrice": "49900.00",
+    "lastPrice": "50100.00",
+    "volume": "1000.00",
+    "openTime": 1700000000000,
+    "closeTime": 1700086400000,
+    "count": 12345,
+}
+
 
 async def test_ticker_24h_happy_path_single_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(payload=TICKER_STATS_FULL)
@@ -409,9 +478,22 @@ async def test_ticker_24h_happy_path_single_symbol(monkeypatch: pytest.MonkeyPat
 
     assert "## BTCUSDT" in result
     assert "weighted avg" in result
+    assert "bid: 50099; ask: 50101" in result
     assert fake.calls == [
         ("GET", "/api/v3/ticker/24hr", {"params": {"type": "FULL", "symbol": "BTCUSDT"}, "auth": "none"})
     ]
+
+
+async def test_ticker_24h_mini_omits_change_weighted_avg_and_bid_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(payload=TICKER_STATS_MINI)
+    _patch_client(monkeypatch, fake)
+
+    result = await md.binance_get_ticker_24h(md.Ticker24hInput(symbol="BTCUSDT", type=md.TickerType.MINI))
+
+    assert "change:" not in result
+    assert "weighted avg" not in result
+    assert "bid:" not in result
+    assert "trades: 12345" in result
 
 
 async def test_ticker_24h_all_symbols_caps_display(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -490,12 +572,15 @@ def test_book_ticker_rejects_symbol_and_symbols() -> None:
 
 
 async def test_rolling_ticker_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _FakeClient(payload=TICKER_STATS_FULL)
+    fake = _FakeClient(payload=TICKER_STATS_NO_BID_ASK)
     _patch_client(monkeypatch, fake)
 
     result = await md.binance_get_rolling_ticker(md.RollingTickerInput(symbol="btcusdt", window_size="4h"))
 
     assert "Rolling ticker (4h)" in result
+    assert "weighted avg" in result
+    # /ticker (rolling) never returns bidPrice/askPrice, even at FULL — must not render N/A.
+    assert "bid:" not in result
     assert fake.calls == [
         (
             "GET",
@@ -520,16 +605,31 @@ def test_rolling_ticker_rejects_bad_window_size() -> None:
         md.RollingTickerInput(symbol="BTCUSDT", window_size="4x")
 
 
+@pytest.mark.parametrize("window_size", ["0m", "60m", "0h", "24h", "0d", "8d"])
+def test_rolling_ticker_rejects_window_size_out_of_range(window_size: str) -> None:
+    with pytest.raises(ValidationError):
+        md.RollingTickerInput(symbol="BTCUSDT", window_size=window_size)
+
+
+@pytest.mark.parametrize("window_size", ["1m", "59m", "1h", "23h", "1d", "7d"])
+def test_rolling_ticker_accepts_window_size_in_range(window_size: str) -> None:
+    params = md.RollingTickerInput(symbol="BTCUSDT", window_size=window_size)
+    assert params.window_size == window_size
+
+
 # -- binance_get_trading_day_ticker -------------------------------------------------------
 
 
 async def test_trading_day_ticker_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _FakeClient(payload=TICKER_STATS_FULL)
+    fake = _FakeClient(payload=TICKER_STATS_NO_BID_ASK)
     _patch_client(monkeypatch, fake)
 
     result = await md.binance_get_trading_day_ticker(md.TradingDayTickerInput(symbol="btcusdt", time_zone="+08:00"))
 
     assert "Trading day ticker" in result
+    assert "weighted avg" in result
+    # /ticker/tradingDay never returns bidPrice/askPrice, even at FULL — must not render N/A.
+    assert "bid:" not in result
     assert fake.calls == [
         (
             "GET",

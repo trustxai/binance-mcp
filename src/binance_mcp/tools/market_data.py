@@ -30,7 +30,11 @@ MAX_TICKER_DISPLAY = 50
 MAX_PRICE_DISPLAY = 100
 
 _SYMBOL_PATTERN = re_compile(r"^[A-Z0-9]{2,20}$")
-_RELEVANT_FILTERS = {"LOT_SIZE", "PRICE_FILTER", "NOTIONAL", "MARKET_LOT_SIZE"}
+# Binance's rolling-ticker windowSize ranges (S2): 1m-59m, 1h-23h, 1d-7d.
+_WINDOW_SIZE_RANGES: dict[str, tuple[int, int]] = {"m": (1, 59), "h": (1, 23), "d": (1, 7)}
+# MIN_NOTIONAL is the legacy name for the NOTIONAL filter; some symbols still carry the
+# old one instead of the new one, so both are relevant and NOTIONAL wins when both exist.
+_RELEVANT_FILTERS = {"LOT_SIZE", "PRICE_FILTER", "NOTIONAL", "MIN_NOTIONAL", "MARKET_LOT_SIZE"}
 
 
 # -- shared helpers -------------------------------------------------------------
@@ -63,6 +67,18 @@ def _to_ms(value: Any) -> int | None:
     raise ValueError(f"Invalid timestamp {value!r} — expected an int (epoch ms) or an ISO-8601 string.")
 
 
+def _validate_window_size_range(value: str) -> str:
+    """Enforce Binance's rolling `windowSize` ranges on top of the `^\\d+[mhd]$` shape:
+    1-59 minutes, 1-23 hours, or 1-7 days."""
+    amount, unit = int(value[:-1]), value[-1]
+    lo, hi = _WINDOW_SIZE_RANGES[unit]
+    if not (lo <= amount <= hi):
+        raise ValueError(
+            f"Invalid window_size {value!r} — minutes must be 1-59, hours 1-23, days 1-7 (got {amount}{unit})."
+        )
+    return value
+
+
 class SymbolStatus(StrEnum):
     """`GET /api/v3/exchangeInfo` symbol lifecycle states."""
 
@@ -79,23 +95,32 @@ class TickerType(StrEnum):
 
 
 def _format_ticker_stats(t: dict[str, Any]) -> str:
-    """Shared renderer for `/ticker/24hr`, `/ticker/tradingDay`, and `/ticker` (rolling).
+    """Shared renderer for `/ticker/24hr`, `/ticker/tradingDay`, and `/ticker` (rolling)
+    stat blocks — their field sets overlap but are NOT identical, so every optional
+    fragment is gated on its own key rather than inferred from another field's presence.
 
-    All three share the same FULL/MINI field shape (price change stats + open/high/low/
-    close/volume + a trade count); MINI omits weightedAvgPrice/bid/ask/counts.
+    `priceChange`/`priceChangePercent` and the open/close-time + trade-count window are
+    present on both FULL and MINI for all three endpoints. `weightedAvgPrice` is FULL-only
+    but shared across all three. `bidPrice`/`askPrice` are unique to `/ticker/24hr` FULL —
+    `/ticker/tradingDay` and `/ticker` never return them, even at FULL.
     """
-    lines = [
-        f"## {t.get('symbol')}",
-        f"- last: {fmt_num(t.get('lastPrice'))}; change: {fmt_num(t.get('priceChange'))} "
-        f"({fmt_num(t.get('priceChangePercent'))}%)",
-        f"- open: {fmt_num(t.get('openPrice'))}; high: {fmt_num(t.get('highPrice'))}; "
-        f"low: {fmt_num(t.get('lowPrice'))}; volume: {fmt_num(t.get('volume'))}",
-    ]
-    if "weightedAvgPrice" in t:
+    lines = [f"## {t.get('symbol')}"]
+    if "priceChange" in t:
         lines.append(
-            f"- weighted avg: {fmt_num(t.get('weightedAvgPrice'))}; "
-            f"bid: {fmt_num(t.get('bidPrice'))}; ask: {fmt_num(t.get('askPrice'))}"
+            f"- last: {fmt_num(t.get('lastPrice'))}; change: {fmt_num(t.get('priceChange'))} "
+            f"({fmt_num(t.get('priceChangePercent'))}%)"
         )
+    else:
+        lines.append(f"- last: {fmt_num(t.get('lastPrice'))}")
+    lines.append(
+        f"- open: {fmt_num(t.get('openPrice'))}; high: {fmt_num(t.get('highPrice'))}; "
+        f"low: {fmt_num(t.get('lowPrice'))}; volume: {fmt_num(t.get('volume'))}"
+    )
+    if "weightedAvgPrice" in t:
+        lines.append(f"- weighted avg: {fmt_num(t.get('weightedAvgPrice'))}")
+    if "bidPrice" in t:
+        lines.append(f"- bid: {fmt_num(t.get('bidPrice'))}; ask: {fmt_num(t.get('askPrice'))}")
+    if "openTime" in t:
         lines.append(
             f"- window: {epoch_to_human(t.get('openTime'))} → {epoch_to_human(t.get('closeTime'))}; "
             f"trades: {t.get('count')}"
@@ -105,7 +130,9 @@ def _format_ticker_stats(t: dict[str, Any]) -> str:
 
 def _format_exchange_symbol(sym: dict[str, Any]) -> str:
     """Render one `exchangeInfo` symbol: status, assets, order types, and the filters
-    an order must respect (LOT_SIZE / PRICE_FILTER / NOTIONAL / MARKET_LOT_SIZE)."""
+    an order must respect (LOT_SIZE / PRICE_FILTER / NOTIONAL / MARKET_LOT_SIZE). Falls
+    back to the legacy MIN_NOTIONAL filter name for the notional row when a symbol still
+    carries that instead of the newer NOTIONAL."""
     filters = {f["filterType"]: f for f in sym.get("filters", []) if f.get("filterType") in _RELEVANT_FILTERS}
     lines = [
         f"## {sym.get('symbol')}",
@@ -127,7 +154,7 @@ def _format_exchange_symbol(sym: dict[str, Any]) -> str:
             f"- PRICE_FILTER: min {fmt_num(f.get('minPrice'))}, max {fmt_num(f.get('maxPrice'))}, "
             f"tick {fmt_num(f.get('tickSize'))}"
         )
-    if (f := filters.get("NOTIONAL")) is not None:
+    if (f := filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL")) is not None:
         lines.append(f"- NOTIONAL: min {fmt_num(f.get('minNotional'))}, applyToMarket {f.get('applyToMarket')}")
     return "\n".join(lines)
 
@@ -454,7 +481,9 @@ async def binance_get_recent_trades(params: RecentTradesInput) -> str:
             "|---|---|---|---|---|",
         ]
         for t in shown:
-            side = "maker-buy" if t.get("isBuyerMaker") else "taker-buy"
+            # isBuyerMaker=true means the buyer posted the resting order, so the taker
+            # (aggressor) sold into it; render the aggressor's side, not the maker's.
+            side = "sell" if t.get("isBuyerMaker") else "buy"
             lines.append(
                 f"| {t.get('id')} | {epoch_to_human(t.get('time'))} | {fmt_num(t.get('price'))} | "
                 f"{fmt_num(t.get('qty'))} | {side} |"
@@ -481,10 +510,10 @@ class AggTradesInput(BaseModel):
     from_id: int | None = Field(
         default=None, description="Aggregate trade id to fetch from (inclusive). Cannot combine with the times."
     )
-    start_time: int | None = Field(
+    start_time: int | str | None = Field(
         default=None, description="Window start (inclusive), epoch ms or ISO-8601. Cannot combine with `from_id`."
     )
-    end_time: int | None = Field(
+    end_time: int | str | None = Field(
         default=None, description="Window end (inclusive), epoch ms or ISO-8601. Cannot combine with `from_id`."
     )
     limit: int = Field(
@@ -575,7 +604,8 @@ async def binance_get_agg_trades(params: AggTradesInput) -> str:
             "|---|---|---|---|---|---|",
         ]
         for t in shown:
-            side = "maker-buy" if t.get("m") else "taker-buy"
+            # `m` is isBuyerMaker; render the aggressor's side (see binance_get_recent_trades).
+            side = "sell" if t.get("m") else "buy"
             lines.append(
                 f"| {t.get('a')} | {epoch_to_human(t.get('T'))} | {fmt_num(t.get('p'))} | {fmt_num(t.get('q'))} | "
                 f"{t.get('f')}-{t.get('l')} | {side} |"
@@ -621,8 +651,8 @@ class KlinesInput(BaseModel):
 
     symbol: str = Field(description="Trading pair symbol, e.g. BTCUSDT.")
     interval: KlineInterval = Field(description="Candle interval.")
-    start_time: int | None = Field(default=None, description="Window start, epoch ms or ISO-8601.")
-    end_time: int | None = Field(
+    start_time: int | str | None = Field(default=None, description="Window start, epoch ms or ISO-8601.")
+    end_time: int | str | None = Field(
         default=None, description="Window end, epoch ms or ISO-8601. Always UTC, even with `time_zone`."
     )
     time_zone: str | None = Field(
@@ -1182,6 +1212,11 @@ class RollingTickerInput(BaseModel):
     @classmethod
     def _validate_symbols(cls, v: list[str] | None) -> list[str] | None:
         return [_normalize_symbol(s) for s in v] if v is not None else v
+
+    @field_validator("window_size")
+    @classmethod
+    def _validate_window_size(cls, v: str | None) -> str | None:
+        return _validate_window_size_range(v) if v is not None else v
 
     @model_validator(mode="after")
     def _check_combo(self) -> RollingTickerInput:
