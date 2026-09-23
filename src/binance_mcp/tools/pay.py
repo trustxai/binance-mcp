@@ -32,6 +32,8 @@ PAGE_LIMIT = 100  # default AND max `limit` for this endpoint
 # `binance_get_pay_history` walk knobs.
 WALK_WINDOW_MS = 89 * 24 * 60 * 60 * 1000  # stay under the 90-day cap with margin
 PAY_HISTORY_LOOKBACK_MONTHS = 18  # "Support for querying orders within the last 18 months"
+# Binance rejects a startTime AT the 18-month boundary (400, code 403004) — keep a day of margin.
+PAY_LOOKBACK_MARGIN_MS = 24 * 60 * 60 * 1000
 DEFAULT_MAX_CALLS = 30  # UID weight 3000 each -> 90,000 UID spent at the default
 
 # Context-window guard on top of the API's own `limit`. Only bounds MARKDOWN display —
@@ -242,6 +244,10 @@ class PayHistoryWalkResult:
     resume_before: int | None
     no_progress: bool
     possibly_incomplete: bool
+    # Set when a request failed mid-walk: the rows collected so far are still returned,
+    # `resume_before` points at the failed range's upper boundary, and this carries the
+    # rendered error (walk rule 7d — never just the error string).
+    stop_error: str | None = None
 
 
 async def _walk_pay_history(client: Any, since_ms: int, until_ms: int, max_calls: int) -> PayHistoryWalkResult:
@@ -286,7 +292,24 @@ async def _walk_pay_history(client: Any, since_ms: int, until_ms: int, max_calls
                     return PayHistoryWalkResult(transactions, calls_used, None, True, possibly_incomplete)
                 return PayHistoryWalkResult(transactions, calls_used, cursor, False, possibly_incomplete)
             start_ms, end_ms = stack.pop()
-            data = await _fetch_pay_window(client, start_ms, end_ms)
+            try:
+                data = await _fetch_pay_window(client, start_ms, end_ms)
+            except Exception as exc:
+                if not transactions and isinstance(exc, RuntimeError):
+                    # Nothing collected and a config-class failure (no credentials,
+                    # kill-switch, envelope): surface it as a plain Error, not a partial walk.
+                    raise
+                # The failed request still spent its weight; the failed range [start, end]
+                # was not fetched, and everything newer than `end_ms` in this top window
+                # already was (LIFO: newer halves pop first).
+                calls_used += 1
+                if end_ms >= until_ms:
+                    return PayHistoryWalkResult(
+                        transactions, calls_used, None, True, possibly_incomplete, handle_api_error(exc)
+                    )
+                return PayHistoryWalkResult(
+                    transactions, calls_used, end_ms, False, possibly_incomplete, handle_api_error(exc)
+                )
             calls_used += 1
             if len(data) >= PAGE_LIMIT:
                 if end_ms > start_ms:
@@ -436,6 +459,8 @@ def _render_pay_history(
     since_ms: int,
     until_ms: int,
     fmt: ResponseFormat,
+    stop_error: str | None = None,
+    since_clamped: bool = False,
 ) -> str:
     if fmt is ResponseFormat.JSON:
         # Full row set — only `clip_response`'s byte cap bounds this, not MAX_DISPLAY_ROWS.
@@ -444,12 +469,14 @@ def _render_pay_history(
                 {
                     "title": "Binance Pay History",
                     "since": since_ms,
+                    "since_clamped": since_clamped,
                     "until": until_ms,
                     "calls_used": calls_used,
                     "count": len(transactions),
                     "resume_before": resume_before,
                     "no_progress": no_progress,
                     "possibly_incomplete": possibly_incomplete,
+                    "stop_error": stop_error,
                     "items": transactions,
                 }
             )
@@ -466,7 +493,24 @@ def _render_pay_history(
         f"Found **{len(transactions):,}** unique transaction(s) (deduped by transactionId within this "
         "call, newest first).",
     ]
-    if no_progress:
+    if since_clamped:
+        lines.append(
+            f"_`since` was clamped to Binance's 18-month lookback ({epoch_to_human(since_ms)}); "
+            "older Pay history is not retrievable via the API._"
+        )
+    if stop_error is not None:
+        lines.append(f"⚠️ Stopped early on a request failure: {stop_error}")
+        if no_progress:
+            lines.append(
+                "The very first request failed, so nothing was collected — fix the cause and call again "
+                "with the same `since`."
+            )
+        elif resume_before is not None:
+            lines.append(
+                f"The rows above are what was collected before the failure. Once the cause is fixed, resume "
+                f"with `since={since_ms}, resume_before={resume_before}` ({epoch_to_human(resume_before)})."
+            )
+    elif no_progress:
         lines.append(
             "⚠️ The budget could not complete even the newest window — raise `max_calls` and call again "
             "with the same `since`/`resume_before`."
@@ -562,7 +606,15 @@ async def binance_get_pay_history(params: PayHistoryInput) -> str:
         since_input = _as_ms(params.since)
         resume_input = _as_ms(params.resume_before)
         until_ms = resume_input if resume_input is not None else _now_ms()
-        since_ms = since_input if since_input is not None else _months_ago_ms(PAY_HISTORY_LOOKBACK_MONTHS)
+        # Binance rejects a startTime at or beyond its 18-month lookback with a 400
+        # (code 403004 "invalid parameter") — measured live 2026-09-23 on the window that
+        # began exactly 18 calendar months back at midnight. Keep one day of margin and
+        # clamp any older `since` to it instead of erroring.
+        lookback_floor_ms = _months_ago_ms(PAY_HISTORY_LOOKBACK_MONTHS) + PAY_LOOKBACK_MARGIN_MS
+        # Clamp only when the floor falls inside the requested range; a range that ends
+        # before the floor is sent as-is and Binance's answer is reported truthfully.
+        since_clamped = since_input is not None and since_input < lookback_floor_ms <= until_ms
+        since_ms = lookback_floor_ms if since_input is None or since_clamped else since_input
 
         if since_ms >= until_ms:
             return (
@@ -585,6 +637,8 @@ async def binance_get_pay_history(params: PayHistoryInput) -> str:
             since_ms=since_ms,
             until_ms=until_ms,
             fmt=params.response_format,
+            stop_error=result.stop_error,
+            since_clamped=since_clamped,
         )
     except Exception as exc:
         return handle_api_error(exc)

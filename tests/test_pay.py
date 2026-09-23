@@ -11,6 +11,8 @@ import pytest
 from pydantic import ValidationError
 
 from binance_mcp.tools.pay import (
+    PAY_HISTORY_LOOKBACK_MONTHS,
+    PAY_LOOKBACK_MARGIN_MS,
     WALK_WINDOW_MS,
     PayHistoryInput,
     PayTransactionsInput,
@@ -554,3 +556,93 @@ async def test_pay_transactions_live() -> None:
 async def test_pay_history_live() -> None:
     result = await binance_get_pay_history(PayHistoryInput(max_calls=1))
     assert isinstance(result, str)
+
+
+# -- t15 live findings (2026-09-23): 18-month boundary + error mid-walk -------------
+
+
+class _FailOnSecondWindowClient:
+    """First pay window answers normally; the second raises the given exception."""
+
+    def __init__(self, first_rows: list[dict[str, Any]], exc: Exception) -> None:
+        self._first_rows = first_rows
+        self._exc = exc
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> _FakeResponse:
+        self.calls.append((method, path, kwargs))
+        if len(self.calls) >= 2:
+            raise self._exc
+        return _FakeResponse({"code": "000000", "message": "success", "data": self._first_rows, "success": True})
+
+
+async def test_walk_pay_history_error_mid_walk_keeps_rows_and_cursor() -> None:
+    until_ms = 3 * WALK_WINDOW_MS
+    boom = _status_error(400, {"code": 403004, "msg": "The request has an invalid parameter"})
+    fake = _FailOnSecondWindowClient([_tx(1, when=until_ms - 10)], boom)
+
+    result = await _walk_pay_history(fake, since_ms=0, until_ms=until_ms, max_calls=10)
+
+    assert [t["transactionId"] for t in result.transactions] == [1]
+    assert result.calls_used == 2  # the failed request still counts
+    assert result.stop_error is not None and result.stop_error.startswith("Error (400)")
+    assert result.no_progress is False
+    # The failed range was window 2: [until - 2W, until - W); its upper boundary is the cursor.
+    assert result.resume_before == until_ms - WALK_WINDOW_MS
+
+
+async def test_pay_history_error_mid_walk_renders_rows_cursor_and_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    until_ms = 3 * WALK_WINDOW_MS
+    boom = _status_error(429, {"code": -1003, "msg": "Too many requests."})
+    fake = _FailOnSecondWindowClient([_tx(1, when=until_ms - 10)], boom)
+    monkeypatch.setattr("binance_mcp.tools.pay.get_client", lambda: fake)
+    monkeypatch.setattr("binance_mcp.tools.pay._now_ms", lambda: until_ms + 20 * WALK_WINDOW_MS)
+
+    md = await binance_get_pay_history(PayHistoryInput(since=0, resume_before=until_ms))
+    fake_json = _FailOnSecondWindowClient([_tx(1, when=until_ms - 10)], boom)  # fresh call counter
+    monkeypatch.setattr("binance_mcp.tools.pay.get_client", lambda: fake_json)
+    js = json.loads(
+        await binance_get_pay_history(PayHistoryInput(since=0, resume_before=until_ms, response_format="json"))
+    )
+
+    assert "Found **1** unique" in md
+    assert "Stopped early on a request failure: Error (429)" in md
+    assert f"resume_before={until_ms - WALK_WINDOW_MS}" in md
+    assert js["count"] == 1 and js["stop_error"].startswith("Error (429)")
+    assert js["resume_before"] == until_ms - WALK_WINDOW_MS and js["no_progress"] is False
+
+
+async def test_walk_pay_history_first_request_error_is_no_progress_not_raise() -> None:
+    boom = _status_error(500, {"code": -1000, "msg": "An unknown error occurred."})
+    fake = _FakeClient(exc=boom)
+
+    result = await _walk_pay_history(fake, since_ms=0, until_ms=WALK_WINDOW_MS, max_calls=5)
+
+    assert result.transactions == [] and result.calls_used == 1
+    assert result.no_progress is True and result.resume_before is None
+    assert result.stop_error is not None and "UNKNOWN" in result.stop_error
+
+
+async def test_walk_pay_history_config_error_with_no_rows_propagates() -> None:
+    fake = _FakeClient(exc=RuntimeError("No Binance API key configured."))
+
+    with pytest.raises(RuntimeError, match="No Binance API key"):
+        await _walk_pay_history(fake, since_ms=0, until_ms=WALK_WINDOW_MS, max_calls=5)
+
+
+async def test_pay_history_since_is_clamped_to_the_lookback(monkeypatch: pytest.MonkeyPatch) -> None:
+    now_ms = 1_790_000_000_000
+    monkeypatch.setattr("binance_mcp.tools.pay._now_ms", lambda: now_ms)
+    floor_ms = _months_ago_ms(PAY_HISTORY_LOOKBACK_MONTHS, now_ms=now_ms) + PAY_LOOKBACK_MARGIN_MS
+    fake = _FakeClient(data_by_window={})  # every window answers empty
+    monkeypatch.setattr("binance_mcp.tools.pay.get_client", lambda: fake)
+
+    js = json.loads(await binance_get_pay_history(PayHistoryInput(since="2017-07-01", response_format="json")))
+    md = await binance_get_pay_history(PayHistoryInput(since="2017-07-01"))
+    default = json.loads(await binance_get_pay_history(PayHistoryInput(response_format="json")))
+
+    assert js["since"] == floor_ms and js["since_clamped"] is True
+    assert "clamped to Binance's 18-month lookback" in md
+    assert default["since"] == floor_ms and default["since_clamped"] is False
+    # No request may start before the floor.
+    assert all(c[2]["params"]["startTime"] >= floor_ms for c in fake.calls)
