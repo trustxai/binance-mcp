@@ -72,6 +72,12 @@ _SYMBOL_PATTERN = r"^[A-Z0-9]{2,20}$"
 # batches if you somehow hold more than this many dust assets.
 _MAX_DUST_ASSETS = 100
 
+# A transferred `amount` must be a plain decimal: `123` or `123.45`. `Decimal()` also
+# accepts '1E+2', '+5', 'Infinity' and 'NaN', none of which belong in a fund-moving
+# query string — and '1E+2' is a hundred times '1' if the far side truncates instead
+# of parsing. The signed payload is the literal string, so it is pinned here.
+_PLAIN_DECIMAL_PATTERN = re.compile(r"^\d+(\.\d+)?$")
+
 
 def _to_ms(value: int | str | None, field: str) -> int | None:
     """Accept an epoch-ms int or an ISO-8601 string on the tool surface; send ms.
@@ -460,15 +466,20 @@ class TransferBetweenWalletsInput(_BaseInput):
     @field_validator("amount")
     @classmethod
     def _check_positive_decimal(cls, value: str, info: ValidationInfo) -> str:
-        """Validate as a positive decimal but return the ORIGINAL string, unrounded."""
-        try:
-            parsed = Decimal(value)
-        except InvalidOperation as exc:
+        """Validate as a plain positive decimal and return the ORIGINAL string, unrounded.
+
+        Only the `123` / `123.45` shapes pass. Scientific notation, a leading sign and
+        `Infinity`/`NaN` all parse fine as a `Decimal` but are not what Binance expects
+        in an `amount`, and `1E+2` is a hundred times `1` if the far side truncates
+        instead of parsing. On a fund-moving call that is not a risk worth taking.
+        """
+        if not _PLAIN_DECIMAL_PATTERN.fullmatch(value):
             raise ValueError(
-                f"{info.field_name} must be a decimal number sent as a string (e.g. '12.5'); got {value!r}."
-            ) from exc
-        if not parsed.is_finite() or parsed <= 0:
-            raise ValueError(f"{info.field_name} must be a positive, finite decimal; got {value!r}.")
+                f"{info.field_name} must be a plain decimal string such as '12.5' — no scientific "
+                f"notation, no sign, no separators; got {value!r}."
+            )
+        if Decimal(value) <= 0:
+            raise ValueError(f"{info.field_name} must be a positive decimal; got {value!r}.")
         return value
 
     @model_validator(mode="after")
@@ -493,8 +504,9 @@ class ConvertDustInput(_BaseInput):
         min_length=1,
         max_length=_MAX_DUST_ASSETS,
         description=(
-            "Assets to convert to BNB, e.g. ['BTC', 'ETH']. At least one. Sent as repeated `asset` "
-            "query keys, which is what Binance expects. Preview them with "
+            "Assets to convert to BNB, e.g. ['BTC', 'ETH']. At least one, at most 100 per call "
+            "(a client-side guard — Binance documents no cap; split into batches if you need more). "
+            "Sent as repeated `asset` query keys, which is what Binance expects. Preview them with "
             "`binance_get_dust_convertible` first — the conversion cannot be undone."
         ),
     )
@@ -1067,6 +1079,12 @@ async def binance_get_asset_detail(params: AssetDetailInput) -> str:
         client = get_client()
         resp = await client.request("GET", "/sapi/v1/asset/assetDetail", auth="signed", params=query or None)
         data = resp.json()
+        # The body is a map keyed by asset, but Binance asset codes are uppercase, so a
+        # lowercase `code` key can only be an error envelope — never an asset. Without
+        # this, a 200 carrying `{"code": -2015, …}` would render as a successful table
+        # with no rows.
+        if (envelope := _envelope_error(data)) is not None:
+            return envelope
         if params.response_format is ResponseFormat.JSON:
             return clip_response(to_json(data))
         detail = data if isinstance(data, dict) else {}
@@ -1362,7 +1380,10 @@ async def binance_transfer_between_wallets(params: TransferBetweenWalletsInput) 
         lines = [
             "# Transfer accepted",
             "",
-            f"Binance accepted a **{params.type.value}** transfer of **{fmt_num(params.amount)} "
+            # The amount is echoed VERBATIM — the exact string that was signed and sent.
+            # fmt_num would normalise it ('25.50000000' -> '25.5'), so the confirmation
+            # would no longer show what actually went on the wire.
+            f"Binance accepted a **{params.type.value}** transfer of **{params.amount} "
             f"{params.asset}** between your own wallets.",
             "",
             f"- **tranId**: {tran_id if tran_id is not None else 'not returned'}",
@@ -1411,6 +1432,10 @@ async def binance_convert_dust_to_bnb(params: ConvertDustInput) -> str:
     **Key permission.** The API key needs **"Enable Spot & Margin Trading"**; this is a
     trade, not a transfer.
 
+    At most **100 assets per call** — a client-side guard, not a Binance limit (Binance
+    documents no cap). Split a longer list into batches; each batch is its own
+    irreversible conversion.
+
     When to Use:
     - After a human approved converting these specific assets, and after the preview
       confirmed they qualify.
@@ -1448,14 +1473,15 @@ async def binance_convert_dust_to_bnb(params: ConvertDustInput) -> str:
         data = resp.json()
         if (envelope := _envelope_error(data)) is not None:
             return envelope
-        results = data.get("transferResult") or [] if isinstance(data, dict) else []
+        body = data if isinstance(data, dict) else {}
+        results = body.get("transferResult") or []
         lines = [
             "# Dust converted to BNB",
             "",
             f"Requested: **{', '.join(params.assets)}**. This cannot be undone.",
             "",
-            f"- **BNB received (totalTransfered)**: {fmt_num(data.get('totalTransfered'))}",
-            f"- **service charge (totalServiceCharge)**: {fmt_num(data.get('totalServiceCharge'))}",
+            f"- **BNB received (totalTransfered)**: {fmt_num(body.get('totalTransfered'))}",
+            f"- **service charge (totalServiceCharge)**: {fmt_num(body.get('totalServiceCharge'))}",
         ]
         if results:
             lines.append("")

@@ -544,6 +544,28 @@ async def test_asset_detail_caps_at_fifty(monkeypatch: pytest.MonkeyPatch) -> No
     assert fake.calls[0][2]["params"] == {"asset": "A000"}
 
 
+async def test_asset_detail_envelope_is_surfaced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 200 body carrying `{code, msg}` is an error here too, not an empty asset map.
+
+    The response is normally a map keyed by asset, but Binance asset codes are
+    uppercase, so a lowercase `code` key can only ever be the error envelope.
+    """
+    fake = _FakeClient(
+        routes={
+            "/sapi/v1/asset/assetDetail": {
+                "code": -2015,
+                "msg": "Invalid API-key, IP, or permissions for action.",
+            }
+        }
+    )
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_asset_detail(AssetDetailInput())
+
+    assert result == "Error: Invalid API-key, IP, or permissions for action. (code -2015)"
+    assert "Binance returned no assets" not in result
+
+
 async def test_asset_detail_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(
         routes={
@@ -590,6 +612,25 @@ async def test_trade_fees_caps_at_fifty(monkeypatch: pytest.MonkeyPatch) -> None
     assert "Showing **50** of **55** symbol(s)" in result
     assert "5 more symbol(s) not shown" in result
     assert fake.calls[0][2]["params"] is None
+
+
+async def test_trade_fees_single_object_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With `symbol` set Binance answers with a bare object, not a one-element array."""
+    fake = _FakeClient(
+        routes={
+            "/sapi/v1/asset/tradeFee": {
+                "symbol": "ETHUSDT",
+                "makerCommission": "0.00075",
+                "takerCommission": "0.001",
+            }
+        }
+    )
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_trade_fees(TradeFeesInput(symbol="ETHUSDT"))
+
+    assert "of **1** symbol(s)" in result
+    assert "| ETHUSDT | 0.075% | 0.1% |" in result
 
 
 async def test_trade_fees_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -692,6 +733,42 @@ async def test_asset_dividends_rejects_inverted_window(monkeypatch: pytest.Monke
     assert fake.calls == []
 
 
+async def test_asset_dividends_rejects_one_sided_window_over_180_days(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With only `start_time`, `end_time` defaults to now — and the cap still applies."""
+    fake = _FakeClient(routes={"/sapi/v1/asset/assetDividend": DIVIDENDS})
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_asset_dividends(AssetDividendsInput(start_time="2020-01-01"))
+
+    assert result.startswith("Error: the start_time/end_time window spans")
+    assert "at most 180 days" in result
+    assert fake.calls == []
+
+
+async def test_asset_dividends_rejects_unparseable_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_to_ms` fails with a readable message naming the field, before any request."""
+    fake = _FakeClient(routes={"/sapi/v1/asset/assetDividend": DIVIDENDS})
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_asset_dividends(AssetDividendsInput(start_time="last tuesday"))
+
+    assert result.startswith("Error: start_time must be an epoch-ms integer")
+    assert "ISO-8601" in result
+    assert "'last tuesday'" in result
+    assert fake.calls == []
+
+
+async def test_asset_dividends_short_numeric_string_is_not_epoch_ms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A numeric string under 12 digits is a typo, not a timestamp — say so, don't send it."""
+    fake = _FakeClient(routes={"/sapi/v1/asset/assetDividend": DIVIDENDS})
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_asset_dividends(AssetDividendsInput(start_time="17672256"))
+
+    assert result.startswith("Error: start_time must be an epoch-ms integer")
+    assert fake.calls == []
+
+
 async def test_asset_dividends_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient(
         routes={
@@ -723,6 +800,10 @@ async def test_transfer_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "**tranId**: 13526853623" in result
     assert "no status and no resulting" in result
     assert "MAIN_FUNDING" in result
+    # The confirmation echoes the amount VERBATIM — the exact string that was signed,
+    # not a normalised rendering of it.
+    assert "transfer of **25.50000000 USDT**" in result
+    assert "25.5 USDT" not in result
     method, path, kwargs = fake.calls[0]
     assert (method, path) == ("POST", "/sapi/v1/asset/transfer")
     assert kwargs["auth"] == "signed"
@@ -790,7 +871,7 @@ async def test_transfer_rejects_missing_isolated_margin_leg(
     assert fake.calls == []
 
 
-@pytest.mark.parametrize("amount", ["0", "-1", "abc", "nan"])
+@pytest.mark.parametrize("amount", ["0", "0.00", "-1", "abc", "nan"])
 async def test_transfer_rejects_non_positive_amount(monkeypatch: pytest.MonkeyPatch, amount: str) -> None:
     fake = _FakeClient(routes={"/sapi/v1/asset/transfer": {"tranId": 1}})
     _patch(monkeypatch, fake)
@@ -798,6 +879,24 @@ async def test_transfer_rejects_non_positive_amount(monkeypatch: pytest.MonkeyPa
     with pytest.raises(ValidationError):
         TransferBetweenWalletsInput(type=TransferType.MAIN_FUNDING, asset="USDT", amount=amount)
 
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("amount", ["1E+2", "1e2", "+5", "Infinity", "1_000", "1.5.2", ".5", "1,5"])
+async def test_transfer_rejects_non_plain_decimal_amount(monkeypatch: pytest.MonkeyPatch, amount: str) -> None:
+    """Only `123` / `123.45` shapes may be signed.
+
+    `Decimal('1E+2')` is a perfectly valid 100, which is exactly the problem: it is a
+    hundred times what an operator reading '1E+2' in a confirmation might assume, and
+    what Binance does with the literal is not something to find out on a live transfer.
+    """
+    fake = _FakeClient(routes={"/sapi/v1/asset/transfer": {"tranId": 1}})
+    _patch(monkeypatch, fake)
+
+    with pytest.raises(ValidationError) as excinfo:
+        TransferBetweenWalletsInput(type=TransferType.MAIN_FUNDING, asset="USDT", amount=amount)
+
+    assert "plain decimal string" in str(excinfo.value)
     assert fake.calls == []
 
 
@@ -918,6 +1017,20 @@ async def test_convert_dust_requires_at_least_one_asset(monkeypatch: pytest.Monk
 
     with pytest.raises(ValidationError):
         ConvertDustInput(assets=[])
+
+    assert fake.calls == []
+
+
+async def test_convert_dust_caps_the_asset_list_at_a_hundred(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 100-asset cap is a client-side guard on an irreversible call, not a Binance limit."""
+    fake = _FakeClient(routes={"/sapi/v1/asset/dust": DUST_RESULT})
+    _patch(monkeypatch, fake)
+
+    at_the_cap = ConvertDustInput(assets=[f"A{i:03d}" for i in range(100)])
+    assert len(at_the_cap.assets) == 100
+
+    with pytest.raises(ValidationError):
+        ConvertDustInput(assets=[f"A{i:03d}" for i in range(101)])
 
     assert fake.calls == []
 
