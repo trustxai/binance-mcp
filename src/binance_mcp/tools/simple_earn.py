@@ -40,7 +40,13 @@ from binance_mcp.formatters import (
 )
 from binance_mcp.server import mcp
 
-_ASSET_PATTERN = r"^[A-Z0-9]{2,20}$"
+# One-letter assets exist on Binance (e.g. W, S) — the {2,20} bound belongs to
+# trading-pair symbols (BTCUSDT), not bare assets.
+_ASSET_PATTERN = r"^[A-Z0-9]{1,20}$"
+
+# Context-window guard on top of the API `limit`: a single page can return up to
+# 100 rows (Binance `size` max), but we never render more than this many.
+MAX_DISPLAY_ROWS = 50
 
 
 def _fmt_pct(value: Any) -> str:
@@ -55,10 +61,29 @@ def _fmt_pct(value: Any) -> str:
 
 
 def _fmt_tier_apr(value: Any) -> str:
-    """Render the tiered-APR map some Flexible products return (e.g. {"0-5BTC": 0.05})."""
-    if not isinstance(value, dict) or not value:
+    """Render the tiered-APR map some Flexible products return (e.g. {"0-5BTC": 0.05}).
+
+    Some products report a single scalar APR instead of a per-tier map — render
+    that via `_fmt_pct` too. Only a genuinely missing/empty/unrecognized shape
+    falls back to "N/A".
+    """
+    if isinstance(value, dict):
+        if not value:
+            return "N/A"
+        return "; ".join(f"{tier} {_fmt_pct(rate)}" for tier, rate in value.items())
+    if value in (None, ""):
         return "N/A"
-    return "; ".join(f"{tier} {_fmt_pct(rate)}" for tier, rate in value.items())
+    return _fmt_pct(value)
+
+
+def _coerce_total(value: Any) -> int | None:
+    """Coerce Binance's `total` to `int` for `paginated_response`; `None` on failure."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_flexible_position(row: dict[str, Any]) -> str:
@@ -102,8 +127,10 @@ class _EarnFlexiblePositionsInput(BaseModel):
         pattern=_ASSET_PATTERN,
         description="Filter by asset, e.g. USDT. Case-insensitive; normalized to uppercase.",
     )
-    product_id: str | None = Field(default=None, description="Filter by a specific Flexible product id (e.g. USDT001).")
-    limit: int = Field(default=10, ge=1, le=100, description="Rows per page (Binance `size`); max 100.")
+    product_id: str | None = Field(
+        default=None, min_length=1, description="Filter by a specific Flexible product id (e.g. USDT001)."
+    )
+    limit: int = Field(default=20, ge=1, le=100, description="Rows per page (Binance `size`); max 100.")
     offset: int = Field(
         default=0,
         ge=0,
@@ -131,9 +158,11 @@ class _EarnLockedPositionsInput(BaseModel):
         pattern=_ASSET_PATTERN,
         description="Filter by asset, e.g. AXS. Case-insensitive; normalized to uppercase.",
     )
-    position_id: str | None = Field(default=None, description="Filter by a specific Locked position id.")
-    project_id: str | None = Field(default=None, description="Filter by a specific Locked project id (e.g. Axs*90).")
-    limit: int = Field(default=10, ge=1, le=100, description="Rows per page (Binance `size`); max 100.")
+    position_id: str | None = Field(default=None, min_length=1, description="Filter by a specific Locked position id.")
+    project_id: str | None = Field(
+        default=None, min_length=1, description="Filter by a specific Locked project id (e.g. Axs*90)."
+    )
+    limit: int = Field(default=20, ge=1, le=100, description="Rows per page (Binance `size`); max 100.")
     offset: int = Field(
         default=0,
         ge=0,
@@ -194,9 +223,11 @@ async def binance_get_earn_flexible_positions(params: _EarnFlexiblePositionsInpu
     rewards (yesterday, real-time, bonus, total).
 
     Pagination:
-    `limit` (Binance `size`, max 100, default 10) and `offset` (house-style; see the
+    `limit` (Binance `size`, max 100, default 20) and `offset` (house-style; see the
     module docstring for the `offset` -> `current` page-number mapping). `total` from
-    Binance drives `has_more`.
+    Binance drives `has_more`. Display is additionally capped at `MAX_DISPLAY_ROWS`
+    (50) even when `limit` asked for more — a truncation note is appended when rows
+    were dropped.
 
     Examples:
     params = {"asset": "USDT", "limit": 20}
@@ -210,24 +241,33 @@ async def binance_get_earn_flexible_positions(params: _EarnFlexiblePositionsInpu
     try:
         client = get_client()
         current_page = params.offset // params.limit + 1
-        query: dict[str, Any] = {
+        raw_query: dict[str, Any] = {
             "asset": params.asset,
             "productId": params.product_id,
             "current": current_page,
             "size": params.limit,
         }
+        query = {key: value for key, value in raw_query.items() if value is not None}
         resp = await client.request("GET", "/sapi/v1/simple-earn/flexible/position", params=query, auth="signed")
         data = resp.json()
         rows = data.get("rows", [])
-        return paginated_response(
+        truncated_note = None
+        if len(rows) > MAX_DISPLAY_ROWS:
+            truncated_note = (
+                f"_[display truncated: {len(rows)} rows on this page, showing the first "
+                f"{MAX_DISPLAY_ROWS} — narrow `asset`/`product_id` or lower `limit` to see the rest]_"
+            )
+            rows = rows[:MAX_DISPLAY_ROWS]
+        result = paginated_response(
             items=rows,
             limit=params.limit,
             offset=params.offset,
             fmt=params.response_format,
             item_formatter=_format_flexible_position,
             title="Simple Earn — Flexible Positions",
-            total=data.get("total"),
+            total=_coerce_total(data.get("total")),
         )
+        return f"{result}\n\n{truncated_note}" if truncated_note else result
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -277,25 +317,35 @@ async def binance_get_earn_locked_positions(params: _EarnLockedPositionsInput) -
     try:
         client = get_client()
         current_page = params.offset // params.limit + 1
-        query: dict[str, Any] = {
+        raw_query: dict[str, Any] = {
             "asset": params.asset,
             "positionId": params.position_id,
             "projectId": params.project_id,
             "current": current_page,
             "size": params.limit,
         }
+        query = {key: value for key, value in raw_query.items() if value is not None}
         resp = await client.request("GET", "/sapi/v1/simple-earn/locked/position", params=query, auth="signed")
         data = resp.json()
         rows = data.get("rows", [])
-        return paginated_response(
+        truncated_note = None
+        if len(rows) > MAX_DISPLAY_ROWS:
+            truncated_note = (
+                f"_[display truncated: {len(rows)} rows on this page, showing the first "
+                f"{MAX_DISPLAY_ROWS} — narrow `asset`/`position_id`/`project_id` or lower `limit` "
+                "to see the rest]_"
+            )
+            rows = rows[:MAX_DISPLAY_ROWS]
+        result = paginated_response(
             items=rows,
             limit=params.limit,
             offset=params.offset,
             fmt=params.response_format,
             item_formatter=_format_locked_position,
             title="Simple Earn — Locked Positions",
-            total=data.get("total"),
+            total=_coerce_total(data.get("total")),
         )
+        return f"{result}\n\n{truncated_note}" if truncated_note else result
     except Exception as exc:
         return handle_api_error(exc)
 

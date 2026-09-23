@@ -113,8 +113,9 @@ async def test_flexible_positions_happy_path(monkeypatch: pytest.MonkeyPatch) ->
     assert "redeemable: True" in result
     assert "airdrop asset: BETH" in result
     call = fake.calls[0]
+    assert call[0] == "GET"
     assert call[1] == "/sapi/v1/simple-earn/flexible/position"
-    assert call[2] == {"params": {"asset": "BTC", "productId": None, "current": 1, "size": 10}, "auth": "signed"}
+    assert call[2] == {"params": {"asset": "BTC", "current": 1, "size": 20}, "auth": "signed"}
 
 
 async def test_flexible_positions_pagination_offset_maps_to_current(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -124,9 +125,11 @@ async def test_flexible_positions_pagination_offset_maps_to_current(monkeypatch:
     await binance_get_earn_flexible_positions(_EarnFlexiblePositionsInput(limit=20, offset=40))
 
     call = fake.calls[0]
+    assert call[0] == "GET"
     assert call[2]["params"]["current"] == 3  # 40 // 20 + 1
     assert call[2]["params"]["size"] == 20
-    assert call[2]["params"]["productId"] is None
+    assert "productId" not in call[2]["params"]
+    assert "asset" not in call[2]["params"]
 
 
 async def test_flexible_positions_product_id_filter(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,8 +140,46 @@ async def test_flexible_positions_product_id_filter(monkeypatch: pytest.MonkeyPa
 
     assert "_No items._" in result
     call = fake.calls[0]
-    assert call[2]["params"]["productId"] == "BTC001"
-    assert call[2]["params"]["asset"] is None
+    assert call[0] == "GET"
+    assert call[2]["params"] == {"productId": "BTC001", "current": 1, "size": 20}
+
+
+async def test_flexible_positions_truncates_display_and_notes_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [{**FLEXIBLE_ROW, "asset": f"A{i}", "productId": f"P{i}"} for i in range(60)]
+    fake = _FakeClient(routes={"/sapi/v1/simple-earn/flexible/position": {"rows": rows, "total": 60}})
+    monkeypatch.setattr("binance_mcp.tools.simple_earn.get_client", lambda: fake)
+
+    md_result = await binance_get_earn_flexible_positions(_EarnFlexiblePositionsInput(limit=100))
+    assert "display truncated: 60 rows" in md_result
+    assert "showing the first 50" in md_result
+    assert "**A49**" in md_result
+    assert "**A50**" not in md_result
+
+    json_result = await binance_get_earn_flexible_positions(
+        _EarnFlexiblePositionsInput(limit=100, response_format=ResponseFormat.JSON)
+    )
+    assert "display truncated: 60 rows" in json_result
+    assert '"asset": "A49"' in json_result
+    assert '"asset": "A50"' not in json_result
+
+
+async def test_flexible_positions_total_as_string_is_coerced(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(routes={"/sapi/v1/simple-earn/flexible/position": {"rows": [FLEXIBLE_ROW], "total": "1"}})
+    monkeypatch.setattr("binance_mcp.tools.simple_earn.get_client", lambda: fake)
+
+    result = await binance_get_earn_flexible_positions(_EarnFlexiblePositionsInput())
+
+    assert "total **1**" in result
+
+
+async def test_flexible_positions_scalar_tier_apr(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = {**FLEXIBLE_ROW, "tierAnnualPercentageRate": "0.07"}
+    fake = _FakeClient(routes={"/sapi/v1/simple-earn/flexible/position": {"rows": [row], "total": 1}})
+    monkeypatch.setattr("binance_mcp.tools.simple_earn.get_client", lambda: fake)
+
+    result = await binance_get_earn_flexible_positions(_EarnFlexiblePositionsInput())
+
+    assert "tiered APR: 7%" in result
 
 
 async def test_flexible_positions_json_format(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,11 +226,9 @@ async def test_locked_positions_happy_path(monkeypatch: pytest.MonkeyPatch) -> N
     assert "duration 90d" in result
     assert "renewable: True" in result
     call = fake.calls[0]
+    assert call[0] == "GET"
     assert call[1] == "/sapi/v1/simple-earn/locked/position"
-    assert call[2] == {
-        "params": {"asset": "AXS", "positionId": None, "projectId": None, "current": 1, "size": 10},
-        "auth": "signed",
-    }
+    assert call[2] == {"params": {"asset": "AXS", "current": 1, "size": 20}, "auth": "signed"}
 
 
 async def test_locked_positions_filters_and_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,13 +240,36 @@ async def test_locked_positions_filters_and_pagination(monkeypatch: pytest.Monke
     )
 
     call = fake.calls[0]
+    assert call[0] == "GET"
     assert call[2]["params"] == {
-        "asset": None,
         "positionId": "123123",
         "projectId": "Axs*90",
         "current": 2,  # 50 // 50 + 1
         "size": 50,
     }
+    assert "asset" not in call[2]["params"]
+
+
+async def test_locked_positions_truncates_display_and_notes_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [{**LOCKED_ROW, "asset": f"A{i}", "positionId": str(i)} for i in range(60)]
+    fake = _FakeClient(routes={"/sapi/v1/simple-earn/locked/position": {"rows": rows, "total": 60}})
+    monkeypatch.setattr("binance_mcp.tools.simple_earn.get_client", lambda: fake)
+
+    result = await binance_get_earn_locked_positions(_EarnLockedPositionsInput(limit=100))
+
+    assert "display truncated: 60 rows" in result
+    assert "showing the first 50" in result
+    assert "**A49**" in result
+    assert "**A50**" not in result
+
+
+async def test_locked_positions_total_as_string_is_coerced(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(routes={"/sapi/v1/simple-earn/locked/position": {"rows": [LOCKED_ROW], "total": "1"}})
+    monkeypatch.setattr("binance_mcp.tools.simple_earn.get_client", lambda: fake)
+
+    result = await binance_get_earn_locked_positions(_EarnLockedPositionsInput())
+
+    assert "total **1**" in result
 
 
 async def test_locked_positions_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,6 +302,7 @@ async def test_earn_account_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "flexible**: 0 BTC / 0 USDT" in result
     assert "locked**: 0.01067982 BTC / 77.1328923 USDT" in result
     call = fake.calls[0]
+    assert call[0] == "GET"
     assert call[1] == "/sapi/v1/simple-earn/account"
     assert call[2] == {"auth": "signed"}
 
