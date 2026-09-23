@@ -26,6 +26,17 @@ from binance_mcp.tools.pay import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _pin_now_before_synthetic_epochs(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Synthetic tests use tiny 1970 epochs; pin "now" to the epoch so Binance's 18-month
+    lookback floor lands before them (a range entirely older than the floor is refused
+    locally). Live tests keep the real clock; tests about the floor override this.
+    """
+    if "live" in request.keywords:
+        return
+    monkeypatch.setattr("binance_mcp.tools.pay._now_ms", lambda: 1)
+
+
 class _FakeResponse:
     def __init__(self, payload: Any) -> None:
         self._payload = payload
@@ -596,7 +607,6 @@ async def test_pay_history_error_mid_walk_renders_rows_cursor_and_error(monkeypa
     boom = _status_error(429, {"code": -1003, "msg": "Too many requests."})
     fake = _FailOnSecondWindowClient([_tx(1, when=until_ms - 10)], boom)
     monkeypatch.setattr("binance_mcp.tools.pay.get_client", lambda: fake)
-    monkeypatch.setattr("binance_mcp.tools.pay._now_ms", lambda: until_ms + 20 * WALK_WINDOW_MS)
 
     md = await binance_get_pay_history(PayHistoryInput(since=0, resume_before=until_ms))
     fake_json = _FailOnSecondWindowClient([_tx(1, when=until_ms - 10)], boom)  # fresh call counter
@@ -646,3 +656,81 @@ async def test_pay_history_since_is_clamped_to_the_lookback(monkeypatch: pytest.
     assert default["since"] == floor_ms and default["since_clamped"] is False
     # No request may start before the floor.
     assert all(c[2]["params"]["startTime"] >= floor_ms for c in fake.calls)
+
+
+class _WindowRoutingClient:
+    """Routes pay windows by (startTime, endTime): rows to return, or an exception to raise."""
+
+    def __init__(
+        self,
+        data_by_window: dict[tuple[int, int], list[dict[str, Any]]],
+        exc_by_window: dict[tuple[int, int], Exception],
+    ) -> None:
+        self._data = data_by_window
+        self._exc = exc_by_window
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> _FakeResponse:
+        self.calls.append((method, path, kwargs))
+        params = kwargs.get("params", {})
+        key = (params.get("startTime"), params.get("endTime"))
+        if key in self._exc:
+            raise self._exc[key]
+        return _FakeResponse({"code": "000000", "message": "success", "data": self._data.get(key, []), "success": True})
+
+
+async def test_walk_pay_history_envelope_error_after_rows_keeps_rows_and_cursor() -> None:
+    from binance_mcp.client import BinanceEnvelopeError
+
+    until_ms = 3 * WALK_WINDOW_MS
+    fake = _FailOnSecondWindowClient([_tx(1, when=until_ms - 10)], BinanceEnvelopeError(403004, "invalid parameter"))
+
+    result = await _walk_pay_history(fake, since_ms=0, until_ms=until_ms, max_calls=10)
+
+    # A RuntimeError subclass AFTER rows were collected must not propagate (rule 7d).
+    assert [t["transactionId"] for t in result.transactions] == [1]
+    assert result.resume_before == until_ms - WALK_WINDOW_MS
+    assert result.stop_error is not None and result.stop_error.startswith("Error: Binance rejected the request")
+
+
+async def test_walk_pay_history_error_in_older_half_after_bisection_resumes_without_gap() -> None:
+    until_ms = WALK_WINDOW_MS
+    mid = until_ms // 2
+    full_page = [_tx(i, when=i) for i in range(100)]
+    newer_half = [_tx(200 + i, when=mid + 1 + i) for i in range(5)]
+    boom = _status_error(429, {"code": -1003, "msg": "Too many requests."})
+    fake = _WindowRoutingClient({(0, until_ms): full_page, (mid + 1, until_ms): newer_half}, {(0, mid): boom})
+
+    result = await _walk_pay_history(fake, since_ms=0, until_ms=until_ms, max_calls=10)
+
+    assert result.calls_used == 3  # top window, newer half, failed older half
+    assert {t["transactionId"] for t in result.transactions} == {200 + i for i in range(5)}
+    assert result.resume_before == mid and result.no_progress is False
+    assert result.stop_error is not None and result.stop_error.startswith("Error (429)")
+
+    # Resume from the error cursor: exactly the failed half is re-fetched, nothing else.
+    fake2 = _WindowRoutingClient({(0, mid): [_tx(300, when=mid - 1)]}, {})
+    resumed = await _walk_pay_history(fake2, since_ms=0, until_ms=result.resume_before, max_calls=10)
+    assert [c[2]["params"]["startTime"] for c in fake2.calls] == [0]
+    assert [c[2]["params"]["endTime"] for c in fake2.calls] == [mid]
+    assert resumed.resume_before is None and [t["transactionId"] for t in resumed.transactions] == [300]
+
+
+async def test_pay_history_range_entirely_before_lookback_is_refused_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    now_ms = 1_790_000_000_000
+    monkeypatch.setattr("binance_mcp.tools.pay._now_ms", lambda: now_ms)
+    floor_ms = _months_ago_ms(PAY_HISTORY_LOOKBACK_MONTHS, now_ms=now_ms) + PAY_LOOKBACK_MARGIN_MS
+    day = 24 * 60 * 60 * 1000
+    fake = _FakeClient(data_by_window={})
+    monkeypatch.setattr("binance_mcp.tools.pay.get_client", lambda: fake)
+
+    md = await binance_get_pay_history(PayHistoryInput(since=floor_ms - 31 * day, resume_before=floor_ms - 6 * day))
+    js = json.loads(
+        await binance_get_pay_history(
+            PayHistoryInput(since=floor_ms - 31 * day, resume_before=floor_ms - 6 * day, response_format="json")
+        )
+    )
+
+    assert fake.calls == []  # never sent: it would be a permanent 400
+    assert "older than Binance's 18-month Pay lookback" in md
+    assert js["count"] == 0 and "older than Binance's 18-month Pay lookback" in js["error"]
