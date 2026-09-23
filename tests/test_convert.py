@@ -170,6 +170,37 @@ def test_normalize_asset_uppercases_and_allows_one_letter_assets() -> None:
     assert _normalize_asset(" w ") == "W"  # real one-letter asset: {1,20}, never {2,20}
     with pytest.raises(ValueError):
         _normalize_asset("BTC/USDT")
+    with pytest.raises(ValueError):
+        _normalize_asset("")
+    # `str.isalnum()` would accept these; Binance would not.
+    with pytest.raises(ValueError):
+        _normalize_asset("BT\u0421")  # Cyrillic ES
+    with pytest.raises(ValueError):
+        _normalize_asset("\u00b2")  # superscript two
+
+
+def test_amount_fields_reject_exponent_sign_and_leading_dot() -> None:
+    for bad in ("1E+5", "+5", ".5", "1e5", "NaN", "Infinity", "-1"):
+        with pytest.raises(ValidationError) as exc_info:
+            ConvertQuoteInput(from_asset="BTC", to_asset="USDT", from_amount=bad)
+        assert "from_amount" in str(exc_info.value)
+    # The plain shapes still pass through verbatim.
+    assert ConvertQuoteInput(from_asset="BTC", to_asset="USDT", from_amount="0.010").from_amount == "0.010"
+    assert ConvertQuoteInput(from_asset="BTC", to_asset="USDT", from_amount="500").from_amount == "500"
+
+
+async def test_sort_key_create_time_survives_a_garbage_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-numeric createTime must not turn a successful walk into an error string."""
+    _pin_now(monkeypatch)
+    start, end = NOW - 86_400_000, NOW
+    rows = [{**_trade(1, created=NOW - 1000), "createTime": "later"}, _trade(2, created=NOW - 2000)]
+    fake = _FakeClient(trade_flow={(start, end): _page(rows)})
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_convert_history(ConvertHistoryInput(start_time=start, end_time=end))
+
+    assert "Found **2** conversion(s)" in result
+    assert not result.startswith("Error")
 
 
 def test_envelope_error_only_fires_on_a_real_error_code() -> None:
@@ -214,7 +245,7 @@ def test_quote_rejects_neither_amount(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_quote_rejects_non_decimal_amount() -> None:
     with pytest.raises(ValidationError) as exc_info:
         ConvertQuoteInput(from_asset="BTC", to_asset="USDT", from_amount="lots")
-    assert "must be a decimal number sent as a string" in str(exc_info.value)
+    assert "must be a plain decimal string" in str(exc_info.value)
 
 
 def test_quote_rejects_same_asset_and_unknown_field() -> None:
@@ -552,23 +583,29 @@ async def test_history_rejects_reversed_bounds_without_calling(monkeypatch: pyte
 
 
 async def test_history_narrows_a_window_on_more_data(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`moreData` is the only continuation tradeFlow offers: re-ask with endTime = oldest - 1."""
+    """`moreData` is the only continuation tradeFlow offers: re-ask with endTime = oldest.
+
+    The boundary is INCLUSIVE, so the re-ask returns the row that sat on it again — which
+    the orderId dedupe absorbs.
+    """
     _pin_now(monkeypatch)
     start, end = NOW - 10 * 86_400_000, NOW
     oldest_first_page = NOW - 3 * 86_400_000
     fake = _FakeClient(
         trade_flow={
             (start, end): _page([_trade(1, created=NOW - 1000), _trade(2, created=oldest_first_page)], more=True),
-            (start, oldest_first_page - 1): _page([_trade(3, created=NOW - 5 * 86_400_000)], more=False),
+            (start, oldest_first_page): _page(
+                [_trade(2, created=oldest_first_page), _trade(3, created=NOW - 5 * 86_400_000)], more=False
+            ),
         }
     )
     _patch(monkeypatch, fake)
 
     result = await binance_get_convert_history(ConvertHistoryInput(start_time=start, end_time=end, limit=2))
 
-    assert fake.windows == [(start, end), (start, oldest_first_page - 1)]
+    assert fake.windows == [(start, end), (start, oldest_first_page)]
     assert [call[2]["params"]["limit"] for call in fake.calls] == [2, 2]
-    assert "Found **3** conversion(s)" in result
+    assert "Found **3** conversion(s)" in result  # orderId 2 came back twice, counted once
     assert "2 API call(s) spent" in result
     assert "resume_before" not in result  # the window completed
 
@@ -581,8 +618,65 @@ async def test_history_flags_more_data_it_cannot_follow(monkeypatch: pytest.Monk
 
     result = await binance_get_convert_history(ConvertHistoryInput(start_time=start, end_time=end))
 
+    assert "no way to continue past" in result
     assert "no usable `createTime`" in result
     assert fake.windows == [(start, end)]
+
+
+async def test_history_keeps_rows_tied_on_the_page_cut(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tie straddling the `limit` cut must not vanish.
+
+    Five conversions, limit=3, and rows 3+4 share one instant: the page returns 1-3, so the
+    exclusive `oldest - 1` boundary used to skip row 4 forever. The inclusive boundary
+    re-reads the tie and the dedupe absorbs row 3.
+    """
+    _pin_now(monkeypatch)
+    start, end = NOW - 86_400_000, NOW
+    tie = NOW - 30_000
+    fake = _FakeClient(
+        trade_flow={
+            (start, end): _page(
+                [_trade(1, created=NOW - 10_000), _trade(2, created=NOW - 20_000), _trade(3, created=tie)],
+                more=True,
+            ),
+            # Binance re-answers the inclusive boundary with BOTH tied rows plus the tail.
+            (start, tie): _page([_trade(3, created=tie), _trade(4, created=tie), _trade(5, created=NOW - 40_000)]),
+        }
+    )
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_convert_history(
+        ConvertHistoryInput(start_time=start, end_time=end, limit=3, response_format="json")
+    )
+
+    payload = json.loads(result)
+    assert fake.windows == [(start, end), (start, tie)]
+    assert sorted(row["orderId"] for row in payload["items"]) == [1, 2, 3, 4, 5]
+    assert payload["possibly_incomplete"] is False
+
+
+async def test_history_flags_a_full_page_inside_one_millisecond(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`limit` rows sharing the window's end instant cannot be narrowed past — say so.
+
+    Reported honestly instead of returning the partial page as if it were complete: there
+    is no `endTime` between `oldest` and `page_end` when they are the same millisecond.
+    """
+    _pin_now(monkeypatch)
+    start, end = NOW - 86_400_000, NOW
+    fake = _FakeClient(trade_flow={(start, end): _page([_trade(i, created=end) for i in range(1, 4)], more=True)})
+    _patch(monkeypatch, fake)
+
+    result = await binance_get_convert_history(
+        ConvertHistoryInput(start_time=start, end_time=end, limit=3, response_format="json")
+    )
+
+    payload = json.loads(result)
+    assert fake.windows == [(start, end)]  # no second call: narrowing cannot advance
+    assert payload["possibly_incomplete"] is True
+    assert len(payload["items"]) == 3
+
+    markdown = await binance_get_convert_history(ConvertHistoryInput(start_time=start, end_time=end, limit=3))
+    assert "share one millisecond" in markdown
 
 
 # -- binance_get_convert_history: the walk --------------------------------------------
@@ -650,7 +744,9 @@ async def test_walk_stops_mid_window_with_the_narrowed_cursor(monkeypatch: pytes
 
     payload = json.loads(result)
     assert payload["calls_used"] == 1
-    assert payload["resume_before"] == oldest - 1
+    # Inclusive, like the narrowing itself: an exclusive cursor would skip rows tied on
+    # `oldest` that this page never reached.
+    assert payload["resume_before"] == oldest
     assert payload["no_progress"] is False
     assert [row["orderId"] for row in payload["items"]] == [1]
 
@@ -720,11 +816,14 @@ async def test_walk_error_on_the_first_call_reports_no_progress(monkeypatch: pyt
 
     assert payload["calls_used"] == 1
     assert payload["items"] == []
-    assert payload["resume_before"] == UNTIL
+    # No cursor at all: one that does not advance past the upper bound would just make a
+    # JSON caller repeat the identical UID-3000 call.
+    assert payload["resume_before"] is None
     assert payload["no_progress"] is True
 
     markdown = await binance_get_convert_history(ConvertHistoryInput(since=since, until=UNTIL))
-    assert "re-covers the same range, it does not advance" in markdown
+    assert "No cursor is offered" in markdown
+    assert "resume_before=" not in markdown
 
 
 async def test_walk_dedupes_overlapping_rows_across_windows(monkeypatch: pytest.MonkeyPatch) -> None:

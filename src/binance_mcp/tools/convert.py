@@ -32,6 +32,7 @@ with a narrower `endTime` — that is what `binance_get_convert_history` automat
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -68,6 +69,11 @@ MAX_PAGE_LIMIT = 1000
 DEFAULT_PAGE_LIMIT = 100
 # UID weight 3000 per tradeFlow call -> 72,000 UID of the 180,000/min budget at the default.
 DEFAULT_MAX_CALLS = 24
+
+# Bare asset codes are ASCII-only, 1-20 chars (the real one-letter assets W and S exist).
+_ASSET_PATTERN = re.compile(r"[A-Z0-9]{1,20}")
+# Amounts travel verbatim: a plain unsigned decimal, no exponent, no sign, no leading dot.
+_DECIMAL_PATTERN = re.compile(r"\d+(\.\d+)?")
 
 # Context-window guards (rule 8) on top of the API's own `limit`. These bound MARKDOWN
 # display only; `response_format="json"` always carries every row that was fetched.
@@ -135,10 +141,14 @@ def _as_ms(value: int | str | None) -> int | None:
 
 
 def _normalize_asset(value: str) -> str:
-    """Uppercase and validate a bare asset code (`BTC`, and the real one-letter assets W/S)."""
+    """Uppercase and validate a bare asset code (`BTC`, and the real one-letter assets W/S).
+
+    ASCII only: `str.isalnum()` accepts Unicode digits and letters (`\u00b2`, `\u0431`), which
+    Binance does not.
+    """
     asset = value.strip().upper()
-    if not asset.isalnum() or not 1 <= len(asset) <= 20:
-        raise ValueError(f"asset must be 1-20 alphanumeric characters (e.g. 'BTC', 'USDT'); got {value!r}.")
+    if _ASSET_PATTERN.fullmatch(asset) is None:
+        raise ValueError(f"asset must be 1-20 characters of A-Z / 0-9 (e.g. 'BTC', 'USDT'); got {value!r}.")
     return asset
 
 
@@ -146,6 +156,13 @@ def _check_positive_decimal(value: str | None, field_name: str) -> str | None:
     """Validate as a positive decimal but return the ORIGINAL string, unrounded."""
     if value is None:
         return None
+    if _DECIMAL_PATTERN.fullmatch(value) is None:
+        # Decimal() happily parses '1E+5', '+5', '.5', 'Infinity' and 'NaN'; Binance's
+        # filters do not. Reject the shape before parsing rather than forwarding it.
+        raise ValueError(
+            f"{field_name} must be a plain decimal string like '0.01' or '500' — no exponent, sign or "
+            f"leading dot; got {value!r}."
+        )
     try:
         parsed = Decimal(value)
     except InvalidOperation as exc:
@@ -220,9 +237,26 @@ def _dedupe_by_order_id(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _create_time_ms(row: dict[str, Any]) -> int | None:
+    """One row's `createTime` as an int, or None when it carries nothing usable."""
+    value = row.get("createTime")
+    if isinstance(value, int):
+        return value
+    text = str(value if value is not None else "").strip()
+    digits = text[1:] if text.startswith("-") else text
+    return int(text) if digits.isdigit() else None
+
+
+def _sort_key_create_time(row: dict[str, Any]) -> int:
+    """Sort key for the final ordering: a row with no usable `createTime` sorts last
+    instead of raising and turning a successful walk into an unexpected-failure error."""
+    ms = _create_time_ms(row)
+    return ms if ms is not None else 0
+
+
 def _oldest_create_time(rows: list[dict[str, Any]]) -> int | None:
     """Smallest `createTime` in a page, or None when no row carries a usable one."""
-    times = [int(row["createTime"]) for row in rows if str(row.get("createTime") or "").lstrip("-").isdigit()]
+    times = [ms for ms in (_create_time_ms(row) for row in rows) if ms is not None]
     return min(times) if times else None
 
 
@@ -445,7 +479,8 @@ class ConvertHistoryInput(_BaseInput):
         ge=1,
         le=100,
         description=f"Budget of GET tradeFlow calls (UID weight 3000 each) to spend before stopping early "
-        f"and returning a `resume_before` cursor. Default {DEFAULT_MAX_CALLS} = 72,000 UID weight.",
+        f"and returning a `resume_before` cursor. Also bounds the `moreData` re-asks inside a single window, "
+        f"so one dense window can consume several calls. Default {DEFAULT_MAX_CALLS} = 72,000 UID weight.",
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="markdown or json output.")
 
@@ -591,7 +626,11 @@ async def _walk_trade_flow(
 
     Binance offers **no cursor parameter** on tradeFlow: the only continuation it gives is
     the `moreData` flag, so a window that still has rows is re-asked with
-    `endTime = min(createTime) - 1` until `moreData` is false or the window is exhausted.
+    `endTime = min(createTime)` — INCLUSIVE, because an exclusive `- 1` would drop every row
+    tied on that instant but cut off by `limit` — until `moreData` is false or the window is
+    exhausted. Tied rows re-read that way are deduped by orderId. When the oldest row is
+    already at the window's end instant, `limit` rows share one millisecond and no narrower
+    `endTime` exists: that is `possibly_incomplete`, not a silent drop.
 
     The budget is checked BEFORE every request, and a request that fails still counts
     against it, so `calls_used` is always the real number of requests made. On any
@@ -609,8 +648,10 @@ async def _walk_trade_flow(
         while True:
             if result.calls_used >= max_calls:
                 result.stop_reason = "budget"
-                result.resume_before = page_end
                 result.no_progress = page_end >= until_ms
+                # A cursor that does not advance past the original upper bound would just
+                # reproduce the identical UID-3000 call: emit none at all.
+                result.resume_before = None if result.no_progress else page_end
                 return result
             try:
                 rows, more_data = await _fetch_trade_flow(client, start_ms=window_start, end_ms=page_end, limit=limit)
@@ -618,8 +659,8 @@ async def _walk_trade_flow(
                 result.calls_used += 1  # the failed request still spent one call of the budget
                 result.stop_reason = "error"
                 result.stop_error = exc
-                result.resume_before = page_end
                 result.no_progress = page_end >= until_ms
+                result.resume_before = None if result.no_progress else page_end
                 return result
             result.calls_used += 1
             result.rows.extend(rows)
@@ -631,9 +672,18 @@ async def _walk_trade_flow(
                 # this window but gave no usable createTime, so those rows cannot be reached.
                 result.possibly_incomplete = True
                 break
-            if oldest - 1 < window_start:
+            if oldest >= page_end:
+                # The page's oldest row already sits at the window's end instant, so >= `limit`
+                # conversions share that single millisecond: narrowing cannot advance past it
+                # and the remainder of that instant is unreachable through this endpoint.
+                result.possibly_incomplete = True
                 break
-            page_end = oldest - 1
+            if oldest < window_start:
+                break
+            # INCLUSIVE narrowing. `oldest - 1` would silently drop every row that shares the
+            # page's oldest createTime but fell past the page cut (a tie straddling the limit);
+            # re-reading the tied rows instead is free, because they are deduped by orderId.
+            page_end = oldest
         next_end = window_start - 1
 
     return result
@@ -1084,13 +1134,13 @@ def _render_convert_history(
         lines.append(f"⚠️ Stopped early — {handle_api_error(result.stop_error)}")
     elif result.stop_reason == "budget":
         lines.append(f"⚠️ Stopped early — the `max_calls` budget ({max_calls}) ran out before reaching the start.")
-    if result.resume_before is not None:
-        if result.no_progress:
-            lines.append(
-                f"`resume_before={result.resume_before}` re-covers the same range, it does not advance — call "
-                "again with a larger `max_calls`, a narrower range, or once the underlying failure is fixed."
-            )
-        elif walking:
+    if result.no_progress:
+        lines.append(
+            "No cursor is offered: the walk never got past its upper bound, so any resume would repeat the "
+            "identical call. Raise `max_calls`, narrow the range, or retry once the underlying failure is fixed."
+        )
+    elif result.resume_before is not None:
+        if walking:
             lines.append(
                 f"Rows before {epoch_to_human(result.resume_before)} were not fetched; continue with "
                 f"`since={since_ms}, resume_before={result.resume_before}`."
@@ -1103,8 +1153,9 @@ def _render_convert_history(
             )
     if result.possibly_incomplete:
         lines.append(
-            "⚠️ Binance flagged `moreData` on a page whose rows carried no usable `createTime`, so this "
-            "endpoint offered no way to reach the remainder of that window — those rows were not fetched."
+            "⚠️ Binance flagged `moreData` on a page this endpoint offers no way to continue past — either its "
+            "rows carried no usable `createTime`, or `limit` rows share one millisecond, which no narrower "
+            "`endTime` can split. The remainder of that instant was not fetched; a larger `limit` may reach it."
         )
     if len(rows) > MAX_DISPLAY_ROWS:
         lines.append(
@@ -1139,8 +1190,9 @@ async def binance_get_convert_history(params: ConvertHistoryInput) -> str:
     Binance **requires both `startTime` and `endTime`** and caps the span at 30 days, and
     the endpoint has **no cursor/offset/page parameter of any kind**. The only
     continuation it offers is the `moreData` flag: when it is true, the same window is
-    re-asked with `endTime = min(createTime) - 1` until it comes back false. Both modes
-    below automate that.
+    re-asked with `endTime = min(createTime)` (inclusive — an exclusive `- 1` would drop
+    rows tied on that instant but cut off by `limit`; the re-read duplicates are deduped by
+    orderId) until it comes back false. Both modes below automate that.
 
     - **Single window** (default): `start_time` / `end_time`. Give one and the other is
       filled locally by the 30-day rule; give neither and the last 30 days are used.
@@ -1242,7 +1294,7 @@ async def binance_get_convert_history(params: ConvertHistoryInput) -> str:
             window_ms=WALK_WINDOW_MS if walking else MAX_CONVERT_WINDOW_MS,
         )
         rows = _dedupe_by_order_id(result.rows)
-        rows.sort(key=lambda row: int(row.get("createTime") or 0), reverse=True)
+        rows.sort(key=_sort_key_create_time, reverse=True)
 
         return _render_convert_history(
             rows,
@@ -1386,7 +1438,10 @@ async def binance_cancel_convert_limit_order(params: CancelConvertLimitOrderInpu
 
     Error Handling:
     An already-filled, already-cancelled or unknown orderId is rejected by Binance — check
-    `binance_get_convert_open_limit_orders` for what is actually resting.
+    `binance_get_convert_open_limit_orders` for what is actually resting. A 5xx or a timeout
+    means the cancellation status is **UNKNOWN**: check
+    `binance_get_convert_open_limit_orders` before cancelling again, because the order may
+    already be gone.
     """
     try:
         client = get_client()
