@@ -1,0 +1,84 @@
+{
+  "company": "trustai",
+  "board": {
+    "backend": "repo",
+    "tasks_file": ".memory/tasks.yaml",
+    "memory_dir": ".memory"
+  },
+  "gates": {
+    "default": "uv run pytest -m \"not live and not trading\" && uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/",
+    "live_smoke": "uv run pytest -m live",
+    "testnet_trading_smoke": "BINANCE_TESTNET=1 BINANCE_TEST_ALLOW_TRADING=1 uv run pytest -m trading"
+  },
+  "routing": {
+    "critical": "claude-fable-5-1",
+    "feature": "claude-opus-5",
+    "mechanical": "claude-sonnet-5",
+    "reduction": "claude-haiku-4-5"
+  },
+  "effort": {
+    "critical": "xhigh",
+    "feature": "xhigh",
+    "mechanical": "medium",
+    "reduction": "low"
+  },
+  "max_parallel": 5,
+  "merge_policy": "human",
+  "review": {
+    "default": "code-review",
+    "flagged_paths": {
+      "src/binance_mcp/client.py": "ultra+security-review",
+      "src/binance_mcp/config.py": "ultra+security-review",
+      "src/binance_mcp/tools/spot_orders.py": "ultra+security-review",
+      "src/binance_mcp/tools/wallet_asset.py": "ultra+security-review",
+      ".github/workflows/*": "ultra+security-review"
+    }
+  },
+  "creds": {
+    "db": "staging-or-local-only"
+  },
+  "caps": {
+    "loop_iterations": 8,
+    "target_max_turns": 25
+  },
+  "interactive_only": [
+    "auth spike",
+    "schema review",
+    "architecture / strangler design",
+    "cutover",
+    "product decision",
+    "PyPI / OIDC trusted-publishing setup",
+    "GitHub repo creation + branch protection",
+    "release cut",
+    "live smoke against the real Binance account (read-only key)",
+    "trading smoke on the spot testnet",
+    "Binance API key creation / permission changes"
+  ],
+  "reversibility_triggers": [
+    {
+      "decision": "publish to PyPI as `amazing-binance-mcp` (ADR-0001; `binance-mcp` and `binance-mcp-server` are taken)",
+      "trigger": "the user registers the pending trusted publisher under a different free name (e.g. `trustai-binance-mcp`)",
+      "fallback": "rename dist + console script in lockstep on main before the first release; import package `binance_mcp` and tool prefix `binance_` never change"
+    },
+    {
+      "decision": "raw httpx client + in-repo HMAC/Ed25519/RSA signing (house standard), no binance-connector / binance-sdk-* dependency",
+      "trigger": "a required endpoint needs a signing or serialization quirk that costs more than a day to reproduce",
+      "fallback": "vendor the exact helper from binance-connector (MIT) into client.py with attribution; still no SDK dependency (the modular SDKs cap python <3.15)"
+    },
+    {
+      "decision": "Binance Card is a DECLARED GAP, not a task (no public REST endpoint for card spending; fiat/payments + pay/transactions are the closest proxies)",
+      "trigger": "Binance publishes a card-transactions endpoint under /sapi",
+      "fallback": "add tools/card.py as a normal wave task"
+    },
+    {
+      "decision": "Spot only in v0.1 (Spot + Wallet + Fiat + Convert + Pay + Spot Algo + Simple Earn reads); Futures / Margin out",
+      "trigger": "an algotrading strategy needs futures or margin orders",
+      "fallback": "new wave: tools/futures_*.py against fapi.binance.com behind a separate BINANCE_ALLOW_FUTURES flag"
+    },
+    {
+      "decision": "stdio-only transport (house standard, airbyte-mcp 1.0.0 precedent)",
+      "trigger": "a required client integration cannot spawn a local process (needs remote HTTP/SSE)",
+      "fallback": "add streamable-http transport behind an env flag in a minor release; stdio remains default"
+    }
+  ]
+}

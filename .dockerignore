@@ -1,0 +1,15 @@
+.venv
+.env
+.git
+.gitignore
+__pycache__
+*.py[oc]
+*.egg-info
+build/
+dist/
+.cursor/
+.vscode/
+docs/
+scripts/
+*.md
+!README.md
