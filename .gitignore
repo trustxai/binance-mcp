@@ -11,6 +11,8 @@ wheels/
 
 # Secrets
 .env
+.env.*
+!.env.example
 *.pem
 
 # Local agent memory / planning state (never push to GitHub)
