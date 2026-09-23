@@ -177,6 +177,24 @@ def _positive_decimal(value: str | None, info: ValidationInfo) -> str | None:
     return value
 
 
+def _positive_int_string(value: str | None, info: ValidationInfo) -> str | None:
+    """Validate a trailing delta as a positive WHOLE number of BIPS; return it verbatim.
+
+    Binance types every `*TrailingDelta` as LONG (S2 L3261 / L3273 for the OCO legs), and
+    the unit is basis points — '100' is 1 percent, so a fraction is not expressible.
+    Rejecting '100.5' here beats letting Binance answer -1100 about an illegal character.
+    """
+    if value is None:
+        return None
+    if not value.isdigit() or int(value) <= 0:
+        raise ValueError(
+            f"{info.field_name} must be a positive WHOLE number of basis points sent as a string "
+            f"('100' = 1 percent, '1' = 0.01 percent). Binance types it as a LONG, so decimals are not "
+            f"accepted; got {value!r}."
+        )
+    return value
+
+
 def _to_ms(value: int | str | None, field: str) -> int | None:
     """Accept an epoch-ms int or an ISO-8601 string on the tool surface; send ms.
 
@@ -263,7 +281,16 @@ def _check_iceberg(
     iceberg_qty: str | None,
     time_in_force: TimeInForce | None,
 ) -> None:
-    """`icebergQty` only applies to a GTC leg, or to a LIMIT_MAKER (S2 L3389, L3543)."""
+    """`icebergQty` only applies to a GTC leg, or to a LIMIT_MAKER (S2 L3389, L3543).
+
+    The two halves of the doc disagree and the wider rule is applied to all three list
+    types on purpose. The OCO leg notes (S2 L3258 / L3270) say GTC-only — but an OCO
+    LIMIT_MAKER leg takes no time-in-force at all, so read literally that rule forbids an
+    iceberg on a leg Binance does accept one on. The OTO/OTOCO notes (L3389, L3543) spell
+    out the form that covers both: "only if <prefix>TimeInForce is GTC, or if
+    <prefix>Type is LIMIT_MAKER". Refusing something Binance accepts is the worse error
+    on a placement path, so that is the rule enforced here.
+    """
     if iceberg_qty is None:
         return
     if time_in_force is not TimeInForce.GTC and leg_type != OrderListLegType.LIMIT_MAKER.value:
@@ -667,16 +694,19 @@ class PlaceOcoOrderInput(_ListPlacementInput):
         "quantity",
         "above_price",
         "above_stop_price",
-        "above_trailing_delta",
         "above_iceberg_qty",
         "below_price",
         "below_stop_price",
-        "below_trailing_delta",
         "below_iceberg_qty",
     )
     @classmethod
     def _check_positive_decimal(cls, value: str | None, info: ValidationInfo) -> str | None:
         return _positive_decimal(value, info)
+
+    @field_validator("above_trailing_delta", "below_trailing_delta")
+    @classmethod
+    def _check_trailing_delta(cls, value: str | None, info: ValidationInfo) -> str | None:
+        return _positive_int_string(value, info)
 
     @model_validator(mode="after")
     def _check_legs(self) -> Self:
@@ -873,12 +903,16 @@ class PlaceOtoOrderInput(_WorkingLegInput):
         "pending_quantity",
         "pending_price",
         "pending_stop_price",
-        "pending_trailing_delta",
         "pending_iceberg_qty",
     )
     @classmethod
     def _check_positive_decimal(cls, value: str | None, info: ValidationInfo) -> str | None:
         return _positive_decimal(value, info)
+
+    @field_validator("pending_trailing_delta")
+    @classmethod
+    def _check_trailing_delta(cls, value: str | None, info: ValidationInfo) -> str | None:
+        return _positive_int_string(value, info)
 
     @model_validator(mode="after")
     def _check_legs(self) -> Self:
@@ -1023,16 +1057,19 @@ class PlaceOtocoOrderInput(_WorkingLegInput):
         "pending_quantity",
         "pending_above_price",
         "pending_above_stop_price",
-        "pending_above_trailing_delta",
         "pending_above_iceberg_qty",
         "pending_below_price",
         "pending_below_stop_price",
-        "pending_below_trailing_delta",
         "pending_below_iceberg_qty",
     )
     @classmethod
     def _check_positive_decimal(cls, value: str | None, info: ValidationInfo) -> str | None:
         return _positive_decimal(value, info)
+
+    @field_validator("pending_above_trailing_delta", "pending_below_trailing_delta")
+    @classmethod
+    def _check_trailing_delta(cls, value: str | None, info: ValidationInfo) -> str | None:
+        return _positive_int_string(value, info)
 
     @model_validator(mode="after")
     def _check_legs(self) -> Self:
@@ -1047,6 +1084,25 @@ class PlaceOtocoOrderInput(_WorkingLegInput):
             iceberg_qty=self.pending_above_iceberg_qty,
         )
         if self.pending_below_type is None:
+            orphans = [
+                name
+                for name, value in (
+                    ("pending_below_client_order_id", self.pending_below_client_order_id),
+                    ("pending_below_price", self.pending_below_price),
+                    ("pending_below_stop_price", self.pending_below_stop_price),
+                    ("pending_below_trailing_delta", self.pending_below_trailing_delta),
+                    ("pending_below_time_in_force", self.pending_below_time_in_force),
+                    ("pending_below_iceberg_qty", self.pending_below_iceberg_qty),
+                    ("pending_below_strategy_id", self.pending_below_strategy_id),
+                    ("pending_below_strategy_type", self.pending_below_strategy_type),
+                )
+                if value is not None
+            ]
+            if orphans:
+                raise ValueError(
+                    f"{', '.join(orphans)} require pending_below_type; a list without a below leg is an "
+                    "OTO — use binance_place_oto_order, or name the below leg's type."
+                )
             return self
         _check_leg(
             "pending_below",
@@ -1086,17 +1142,24 @@ class PlaceOtocoOrderInput(_WorkingLegInput):
                 "pendingAboveIcebergQty": self.pending_above_iceberg_qty,
                 "pendingAboveStrategyId": self.pending_above_strategy_id,
                 "pendingAboveStrategyType": self.pending_above_strategy_type,
-                "pendingBelowType": _enum_value(self.pending_below_type),
-                "pendingBelowClientOrderId": self.pending_below_client_order_id,
-                "pendingBelowPrice": self.pending_below_price,
-                "pendingBelowStopPrice": self.pending_below_stop_price,
-                "pendingBelowTrailingDelta": self.pending_below_trailing_delta,
-                "pendingBelowTimeInForce": _enum_value(self.pending_below_time_in_force),
-                "pendingBelowIcebergQty": self.pending_below_iceberg_qty,
-                "pendingBelowStrategyId": self.pending_below_strategy_id,
-                "pendingBelowStrategyType": self.pending_below_strategy_type,
             }
         )
+        if self.pending_below_type is not None:
+            # Guarded rather than mapped unconditionally: a below-leg field without its
+            # type is rejected by the validator above, and this keeps the two in step.
+            raw.update(
+                {
+                    "pendingBelowType": self.pending_below_type.value,
+                    "pendingBelowClientOrderId": self.pending_below_client_order_id,
+                    "pendingBelowPrice": self.pending_below_price,
+                    "pendingBelowStopPrice": self.pending_below_stop_price,
+                    "pendingBelowTrailingDelta": self.pending_below_trailing_delta,
+                    "pendingBelowTimeInForce": _enum_value(self.pending_below_time_in_force),
+                    "pendingBelowIcebergQty": self.pending_below_iceberg_qty,
+                    "pendingBelowStrategyId": self.pending_below_strategy_id,
+                    "pendingBelowStrategyType": self.pending_below_strategy_type,
+                }
+            )
         return {key: value for key, value in raw.items() if value is not None}
 
 
@@ -1569,6 +1632,11 @@ async def binance_get_all_order_lists(params: GetAllOrderListsInput) -> str:
     - For what is armed right now — `binance_get_open_order_lists` costs weight 6.
     - For one known list — `binance_get_order_list` costs weight 4.
     - For plain (non-list) orders — `binance_get_all_orders` (spot_orders.py).
+
+    Returns:
+    A markdown table (time, symbol, orderListId, contingencyType, listStatusType,
+    listOrderStatus, listClientOrderId, leg count) capped at 50 rows, or the raw array
+    with `response_format="json"`.
 
     Pagination:
     `limit` is 1-1000 (Binance default 500) and at most 50 rows are rendered; use

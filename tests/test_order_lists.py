@@ -417,6 +417,22 @@ async def test_place_oco_amounts_must_be_positive_decimal_strings(monkeypatch: p
     assert fake.calls == []
 
 
+async def test_trailing_delta_must_be_whole_basis_points(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Binance types every *TrailingDelta as LONG: '100' is 1 percent, '100.5' is not a thing."""
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+
+    with pytest.raises(ValidationError, match="WHOLE number of basis points"):
+        PlaceOcoOrderInput(**{**OCO_SELL, "below_trailing_delta": "100.5"})
+    with pytest.raises(ValidationError, match="WHOLE number of basis points"):
+        PlaceOtoOrderInput(**{**OTO_LIMIT, "pending_trailing_delta": "0"})
+    with pytest.raises(ValidationError, match="WHOLE number of basis points"):
+        PlaceOtocoOrderInput(**{**OTOCO, "pending_above_trailing_delta": "2.5"})
+    with pytest.raises(ValidationError, match="WHOLE number of basis points"):
+        PlaceOtocoOrderInput(**{**OTOCO, "pending_below_trailing_delta": "-100"})
+    assert fake.calls == []
+
+
 async def test_place_oco_symbol_is_uppercased_and_validated(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeClient()
     _patch(monkeypatch, fake)
@@ -925,6 +941,23 @@ async def test_place_otoco_without_a_below_leg_is_accepted(monkeypatch: pytest.M
     params = fake.calls[0][2]["params"]
     assert params["pendingAboveType"] == "LIMIT_MAKER"
     assert not [key for key in params if key.startswith("pendingBelow")]
+
+
+async def test_place_otoco_below_leg_fields_require_the_below_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dropping only the type would silently send a priced leg Binance cannot place."""
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+
+    with pytest.raises(ValidationError, match="require pending_below_type"):
+        PlaceOtocoOrderInput(
+            **{
+                **OTOCO,
+                "pending_below_type": None,
+                "pending_below_stop_price": None,
+                "pending_below_time_in_force": None,
+            }
+        )
+    assert fake.calls == []
 
 
 async def test_place_otoco_rejects_pending_pair_price_ordering(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1479,11 +1512,16 @@ async def test_trading_round_trip_on_testnet(monkeypatch: pytest.MonkeyPatch) ->
             list_client_order_id=list_client_order_id,
         )
     )
-    assert "# OTO order list placed on BTCUSDT" in placed, placed
-    assert list_client_order_id in placed
-
-    cancelled = await binance_cancel_order_list(
-        CancelOrderListInput(symbol=symbol, list_client_order_id=list_client_order_id)
-    )
+    try:
+        assert "# OTO order list placed on BTCUSDT" in placed, placed
+        assert list_client_order_id in placed
+    finally:
+        # A failed assertion must never leave a list resting on the testnet book, so the
+        # cancel runs either way. Tools return strings instead of raising, so this cannot
+        # mask the original failure: a cancel of a list that was never placed just comes
+        # back as an `Error (400) … -2011` string.
+        cancelled = await binance_cancel_order_list(
+            CancelOrderListInput(symbol=symbol, list_client_order_id=list_client_order_id)
+        )
     assert "# Order list cancelled on BTCUSDT" in cancelled, cancelled
     assert "CANCELED" in cancelled
