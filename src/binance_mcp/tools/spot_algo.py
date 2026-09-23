@@ -131,6 +131,19 @@ def _envelope_error(data: Any) -> str | None:
     return None
 
 
+def _unconfirmed(data: Any) -> str | None:
+    """Return an `Error:` line unless the body explicitly says `success: true`, else None.
+
+    `_envelope_error` catches the failures Binance *declares*. This catches the ones it
+    does not: a truncated body, a shape change, a proxy's empty `{}`. On a money path
+    "no news" is not confirmation — the only body worth rendering as a confirmation is
+    one that literally says the request succeeded.
+    """
+    if isinstance(data, dict) and data.get("success") is True:
+        return None
+    return f"Error: Binance did not confirm the TWAP (body: {to_json(data)})"
+
+
 def _single_algo_id(algo_id: int | None, client_algo_id: str | None) -> dict[str, Any]:
     """Return the id param for a cancel — exactly one id, checked here.
 
@@ -167,8 +180,8 @@ def _algo_order_rows(orders: list[dict[str, Any]]) -> list[str]:
     if len(orders) > MAX_DISPLAY_ROWS:
         lines.append("")
         lines.append(
-            f"_[{len(orders) - MAX_DISPLAY_ROWS} more algo order(s) not shown — narrow the query or use "
-            'response_format="json"]_'
+            f"_[{len(orders) - MAX_DISPLAY_ROWS} more algo order(s) not shown — narrow the query, lower "
+            f'`page_size` to {MAX_DISPLAY_ROWS}, or use response_format="json", for the rest]_'
         )
     return lines
 
@@ -222,8 +235,8 @@ def _sub_order_table(data: dict[str, Any], algo_id: int) -> list[str]:
     if len(sub_orders) > MAX_DISPLAY_ROWS:
         lines.append("")
         lines.append(
-            f"_[{len(sub_orders) - MAX_DISPLAY_ROWS} more sub-order(s) not shown — raise `page` or use "
-            'response_format="json"]_'
+            f"_[{len(sub_orders) - MAX_DISPLAY_ROWS} more sub-order(s) not shown — lower `page_size` to "
+            f'{MAX_DISPLAY_ROWS}, or use response_format="json", for the rest]_'
         )
     return lines
 
@@ -301,6 +314,13 @@ class PlaceTwapOrderInput(_BaseInput):
         """Validate as a positive decimal but return the ORIGINAL string, unrounded."""
         if value is None:
             return None
+        if "e" in value.lower():
+            # Decimal("1e-3") parses, but Binance's filters read the literal string and
+            # reject scientific notation outright — catch it here, not at -1111.
+            raise ValueError(
+                f"{info.field_name} must be plain decimal notation, not scientific "
+                f"(write '0.001', not '1e-3'); got {value!r}."
+            )
         try:
             parsed = Decimal(value)
         except InvalidOperation as exc:
@@ -329,12 +349,17 @@ class CancelAlgoOrderInput(_BaseInput):
 
     algo_id: int | None = Field(
         default=None,
+        ge=1,
         description="Binance algoId of the algo order to cancel. Pass this OR client_algo_id.",
     )
     client_algo_id: str | None = Field(
         default=None,
-        min_length=1,
-        description="The clientAlgoId you sent when placing. Pass this OR algo_id. Binance: clientAlgoId.",
+        min_length=CLIENT_ALGO_ID_LENGTH,
+        max_length=CLIENT_ALGO_ID_LENGTH,
+        description=(
+            "The clientAlgoId you sent when placing — exactly 32 characters, the same bound the "
+            "placement enforces. Pass this OR algo_id. Binance: clientAlgoId."
+        ),
     )
 
 
@@ -373,7 +398,7 @@ class GetAlgoOrderHistoryInput(_PagedInput):
 class GetAlgoSubOrdersInput(_PagedInput):
     """Params for `GET /sapi/v1/algo/spot/subOrders`."""
 
-    algo_id: int = Field(description="Binance algoId of the algo order whose fills you want (mandatory).")
+    algo_id: int = Field(ge=1, description="Binance algoId of the algo order whose fills you want (mandatory).")
 
 
 # -- tools ---------------------------------------------------------------------------
@@ -456,6 +481,8 @@ async def binance_place_twap_order(params: PlaceTwapOrderInput) -> str:
         data = resp.json()
         if (error := _envelope_error(data)) is not None:
             return error
+        if (unconfirmed := _unconfirmed(data)) is not None:
+            return unconfirmed
         lines = [
             f"# TWAP order accepted on {params.symbol}",
             "",
@@ -513,7 +540,7 @@ async def binance_cancel_algo_order(params: CancelAlgoOrderInput) -> str:
       consequence and gives you the algoId this tool needs.
 
     Returns:
-    A confirmation echoing exactly the three fields Binance returned — `algoId`,
+    A confirmation echoing exactly the four fields Binance returned — `algoId`,
     `success`, `code`, `msg` — with no claim about how much of the order had executed.
     A `success: false` body (HTTP 200) is rendered as `Error: <msg> (code <code>)`.
 
@@ -534,6 +561,8 @@ async def binance_cancel_algo_order(params: CancelAlgoOrderInput) -> str:
         data = resp.json()
         if (error := _envelope_error(data)) is not None:
             return error
+        if (unconfirmed := _unconfirmed(data)) is not None:
+            return unconfirmed
         lines = [
             "# Algo order cancelled",
             "",
@@ -639,10 +668,16 @@ async def binance_get_algo_order_history(params: GetAlgoOrderHistoryInput) -> st
       a row here only carries the aggregate.
     - For ordinary spot order history — `binance_get_all_orders` (spot_orders.py).
 
+    Returns:
+    A markdown table (bookTime, algoId, symbol, side, algoStatus, algoType, totalQty,
+    executedQty, executedAmt, avgPrice, urgency, endTime) capped at 50 rows, or the raw
+    `{total, orders[]}` payload with `response_format="json"` (which also carries
+    `clientAlgoId`).
+
     Pagination:
     `page` (1-based) and `page_size` (1-100, default 100) map to Binance's `page` /
-    `pageSize`. At most 50 rows are rendered; raise `page` or use
-    `response_format="json"` for the rest.
+    `pageSize`. Only 50 rows are rendered, so a full 100-row page hides rows 51-100:
+    lower `page_size` to 50, or use `response_format="json"`, for the rest.
 
     Examples:
         params = {}
@@ -712,15 +747,15 @@ async def binance_get_algo_sub_orders(params: GetAlgoSubOrdersInput) -> str:
     - For a symbol-wide trade list — `binance_get_my_trades` (trade_history.py) covers
       every fill, algo or not.
 
-    Pagination:
-    `page` (1-based) and `page_size` (1-100, default 100) map to Binance's `page` /
-    `pageSize`. At most 50 sub-orders are rendered; raise `page` or use
-    `response_format="json"` for the rest.
-
     Returns:
     The order-level totals (`total`, `executedQty`, `executedAmt`) followed by a table of
     sub-orders: bookTime, subId, orderId, symbol, side, orderStatus, executedQty,
     executedAmt, avgPrice and the fee with its asset.
+
+    Pagination:
+    `page` (1-based) and `page_size` (1-100, default 100) map to Binance's `page` /
+    `pageSize`. Only 50 rows are rendered, so a full 100-row page hides rows 51-100:
+    lower `page_size` to 50, or use `response_format="json"`, for the rest.
 
     Examples:
         params = {"algo_id": 14511}

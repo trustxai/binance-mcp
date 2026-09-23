@@ -192,6 +192,9 @@ async def test_place_twap_order_sends_optional_params_verbatim(monkeypatch: pyte
 
 async def test_place_twap_order_success_false_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A `success: false` body arrives with HTTP 200 — it must never read as a confirmation."""
+    # In production the client's `_check_envelope` raises BinanceEnvelopeError on this shape
+    # before the tool ever sees it; the fake client bypasses that, so this exercises the
+    # tool-level net that has to hold if the client's check ever stops covering it.
     fake = _FakeClient(
         routes={
             NEW_TWAP_PATH: {
@@ -246,6 +249,31 @@ async def test_place_twap_order_rejects_non_decimal_quantity(monkeypatch: pytest
         PlaceTwapOrderInput(symbol="BTCUSDT", side="BUY", quantity="lots", duration=3600)
     with pytest.raises(ValidationError, match="quantity"):
         PlaceTwapOrderInput(symbol="BTCUSDT", side="BUY", quantity="-1", duration=3600)
+    assert fake.calls == []
+
+
+async def test_place_twap_order_unconfirmed_body_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty 200 body declares nothing — on a money path that is not a confirmation."""
+    fake = _FakeClient(routes={NEW_TWAP_PATH: {}})
+    _patch(monkeypatch, fake)
+
+    result = await binance_place_twap_order(
+        PlaceTwapOrderInput(symbol="BTCUSDT", side="BUY", quantity="0.5", duration=3600)
+    )
+
+    assert result.startswith("Error: Binance did not confirm the TWAP")
+    assert "accepted" not in result
+
+
+async def test_place_twap_order_rejects_scientific_notation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`Decimal("1e-3")` parses fine; Binance's filters read the literal string and reject it."""
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+
+    with pytest.raises(ValidationError, match="scientific"):
+        PlaceTwapOrderInput(symbol="BTCUSDT", side="BUY", quantity="1e-3", duration=3600)
+    with pytest.raises(ValidationError, match="scientific"):
+        PlaceTwapOrderInput(symbol="BTCUSDT", side="BUY", quantity="0.5", duration=3600, limit_price="6.5E4")
     assert fake.calls == []
 
 
@@ -329,6 +357,8 @@ async def test_cancel_algo_order_requires_exactly_one_id(monkeypatch: pytest.Mon
 
 
 async def test_cancel_algo_order_success_false_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same as the placement: the client's `_check_envelope` fires first in production, and
+    # this asserts the tool-level net underneath it.
     fake = _FakeClient(
         routes={CANCEL_PATH: {"algoId": 14511, "success": False, "code": -1146, "msg": "Order does not exist."}}
     )
@@ -338,6 +368,29 @@ async def test_cancel_algo_order_success_false_is_an_error(monkeypatch: pytest.M
 
     assert result == "Error: Order does not exist. (code -1146)"
     assert "cancelled" not in result
+
+
+async def test_cancel_algo_order_unconfirmed_body_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty 200 body is not a cancellation — the order may well still be working."""
+    fake = _FakeClient(routes={CANCEL_PATH: {}})
+    _patch(monkeypatch, fake)
+
+    result = await binance_cancel_algo_order(CancelAlgoOrderInput(algo_id=14511))
+
+    assert result.startswith("Error: Binance did not confirm the TWAP")
+    assert "cancelled" not in result
+
+
+async def test_cancel_algo_order_rejects_short_client_algo_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cancel reuses the placement's exact-32 bound, so a truncated id dies locally."""
+    fake = _FakeClient()
+    _patch(monkeypatch, fake)
+
+    with pytest.raises(ValidationError, match="client_algo_id"):
+        CancelAlgoOrderInput(client_algo_id=CLIENT_ALGO_ID[:31])
+    with pytest.raises(ValidationError, match="algo_id"):
+        CancelAlgoOrderInput(algo_id=0)
+    assert fake.calls == []
 
 
 async def test_cancel_algo_order_kill_switch_message_is_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
