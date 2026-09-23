@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import pytest
 
-from binance_mcp.config import Settings
+from binance_mcp.config import Settings, get_settings
 from binance_mcp.tools.health import binance_health_check
 
 
@@ -157,3 +157,17 @@ async def test_health_connection_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result.startswith("Error")
     assert "could not connect" in result
+
+
+@pytest.mark.live
+async def test_health_live_smoke() -> None:
+    """Real call with the developer's key: connectivity, drift and the permission flags.
+
+    The spot testnet has no /sapi, so this exercises the real account (read-only).
+    """
+    get_settings.cache_clear()
+    result = await binance_health_check()
+
+    assert "connectivity**: OK" in result
+    assert "API key permissions" in result
+    assert "withdrawals**: False" in result, "the key used for this server must not be able to withdraw"
