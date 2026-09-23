@@ -66,8 +66,10 @@ _SYMBOL_PATTERN = re_compile(r"^[A-Z0-9]{2,20}$")
 _ASSET_PATTERN = re_compile(r"^[A-Z0-9]{1,20}$")
 
 # `exchangeInfo` is 3707 symbols and IP weight 20 — fetched once per process and kept
-# here (symbol -> the exchangeInfo entry). Tests clear it between cases.
-_SYMBOL_CACHE: dict[str, dict[str, Any]] = {}
+# here as symbol -> (baseAsset, quoteAsset, status). Only those three fields are
+# retained: the full entries carry every order type and filter, ~69 MB held for the life
+# of the process for nothing. Tests clear it between cases.
+_SYMBOL_CACHE: dict[str, tuple[str, str, str]] = {}
 
 
 # -- shared helpers ------------------------------------------------------------------
@@ -197,18 +199,24 @@ def _trade_row(trade: dict[str, Any], *, with_symbol: bool) -> str:
     )
 
 
-async def _load_exchange_symbols(client: Any) -> dict[str, dict[str, Any]]:
+async def _load_exchange_symbols(client: Any) -> dict[str, tuple[str, str, str]]:
     """`GET /api/v3/exchangeInfo` once per process (IP weight 20), cached module-level.
 
     3707 symbols is far too much to dump at an LLM and far too expensive to re-fetch per
-    tool call, but the base/quote mapping is exactly what symbol discovery needs.
+    tool call, but the base/quote/status triple is exactly what symbol discovery needs —
+    and it is all that is kept, because the full entries retain ~69 MB for the life of
+    the process.
     """
     if not _SYMBOL_CACHE:
         resp = await client.request("GET", "/api/v3/exchangeInfo", params={}, auth="none")
         for entry in resp.json().get("symbols", []):
             symbol = entry.get("symbol")
             if symbol:
-                _SYMBOL_CACHE[str(symbol)] = entry
+                _SYMBOL_CACHE[str(symbol)] = (
+                    str(entry.get("baseAsset", "")),
+                    str(entry.get("quoteAsset", "")),
+                    str(entry.get("status", "")),
+                )
     return _SYMBOL_CACHE
 
 
@@ -262,7 +270,8 @@ def _check_my_trades_combo(params: MyTradesInput) -> str | None:
     if params.order_id is not None and has_window:
         return (
             "Error: `order_id` cannot combine with `start_time`/`end_time` on myTrades. Binance accepts only: "
-            "symbol; symbol+order_id; symbol+from_id; symbol+start_time[+end_time]; symbol+order_id+from_id."
+            "symbol; symbol+order_id; symbol+from_id; symbol+start_time; symbol+end_time; "
+            "symbol+start_time+end_time; symbol+order_id+from_id."
         )
     if params.from_id is not None and has_window:
         return (
@@ -320,9 +329,11 @@ async def binance_get_my_trades(params: MyTradesInput) -> str:
 
     Pagination / Windows:
     Binance accepts only these combinations: `symbol`; `symbol`+`order_id`;
-    `symbol`+`from_id`; `symbol`+`start_time`[+`end_time`]; `symbol`+`order_id`+`from_id`.
-    `start_time`..`end_time` must span **at most 24 hours** — a wider window is rejected
-    here, with no call spent. To page, re-call with `from_id` = the last id + 1.
+    `symbol`+`from_id`; `symbol`+`start_time`; `symbol`+`end_time`;
+    `symbol`+`start_time`+`end_time`; `symbol`+`order_id`+`from_id`. `start_time` and
+    `end_time` are each legal on their own — only *together* do they have to span **at
+    most 24 hours**, and a wider window is rejected here with no call spent. To page,
+    re-call with `from_id` = the last id + 1.
 
     Examples:
     params = {"symbol": "BTCUSDT", "limit": 100}
@@ -452,17 +463,23 @@ async def _discover_candidate_assets(client: Any, extra_assets: list[str]) -> tu
 
 
 def _select_symbols(
-    symbols: dict[str, dict[str, Any]], candidates: set[str], quote_assets: list[str], include_break: bool
+    symbols: dict[str, tuple[str, str, str]], candidates: set[str], quote_assets: list[str], include_break: bool
 ) -> list[str]:
-    """Every listed symbol whose base OR quote is a candidate asset, restricted to the
-    whitelisted quote assets and (by default) to symbols still TRADING."""
+    """Every listed symbol whose BASE asset is a candidate, quoted either in a whitelisted
+    quote asset or in another candidate asset, and (by default) still TRADING.
+
+    The base side is what makes a pair plausible. Accepting a match on the quote side
+    alone selects every pair quoted in a stablecoin the account merely holds: measured on
+    the real `exchangeInfo`, USDT by itself is 493 TRADING pairs (9,860 weight) and a
+    ten-asset account reached 16,560 — 5.5x the default budget, for pairs it never traded.
+    Requiring the base asset also ADDS pairs a quote whitelist would have dropped: a
+    holder of {BTC, TRY, USDT} gets BTCTRY and USDTTRY, because TRY is a candidate.
+    """
     quotes = set(quote_assets)
     selected = [
         name
-        for name, entry in symbols.items()
-        if str(entry.get("quoteAsset", "")) in quotes
-        and (str(entry.get("baseAsset", "")) in candidates or str(entry.get("quoteAsset", "")) in candidates)
-        and (include_break or str(entry.get("status")) == "TRADING")
+        for name, (base, quote, status) in symbols.items()
+        if base in candidates and (quote in quotes or quote in candidates) and (include_break or status == "TRADING")
     ]
     return sorted(selected)
 
@@ -490,17 +507,15 @@ async def binance_discover_traded_symbols(params: DiscoverTradedSymbolsInput) ->
     (weight 20, zero balances omitted), `POST /sapi/v3/asset/getUserAsset` (weight 5, the
     funding/spot asset list) and `GET /sapi/v1/asset/dribblet` (weight 1, the last 100
     dust conversions) — then crosses them with every `exchangeInfo` symbol (weight 20,
-    fetched once per process and cached) whose **base OR quote** is a candidate asset.
-    Total discovery cost: ~46 IP weight of the 6000/min budget.
+    fetched once per process and cached) whose **base asset is a candidate** and whose
+    quote asset is either whitelisted (`quote_assets`) or itself a candidate. Total
+    discovery cost: ~46 IP weight of the 6000/min budget.
 
-    Blind spot, stated plainly: an asset bought and then fully sold within spot, never
-    deposited, withdrawn or dust-converted, leaves no trace to discover. Name it in
-    `extra_assets`.
-
-    Cost trap, equally plainly: the match is base **or** quote, so a candidate asset that
-    is also a quote asset — USDT is, and almost every account holds some — selects every
-    pair quoted in it (~490 for USDT). Read the estimated weight before walking, and
-    narrow `quote_assets` when it is larger than you want to spend.
+    Blind spot, stated plainly: the match is on the **base** asset, so an asset bought and
+    then fully sold within spot — never deposited, withdrawn or dust-converted — leaves no
+    trace to discover, and its pair is missed. Name it in `extra_assets`. Matching on the
+    quote side too would not rescue it and costs a fortune: on the real `exchangeInfo`,
+    USDT alone drags in 493 TRADING pairs (9,860 weight).
 
     When to Use:
     - Before `binance_get_all_my_trades`, to see (and prune) the symbol list and its cost.
@@ -716,6 +731,11 @@ async def _walk_my_trades(
                     result.symbols_done.append(symbol)
                     break
     except Exception as exc:  # noqa: BLE001 — partial rows + cursor beat a bare error string
+        if not result.trades and isinstance(exc, RuntimeError):
+            # Nothing collected and nothing resumable: missing credentials, the trading
+            # kill-switch, a forbidden path, a `success: false` envelope. Let it surface
+            # as a plain `Error:` instead of dressing it up as a walk that found nothing.
+            raise
         result.error = handle_api_error(exc)
     return result
 
@@ -826,7 +846,9 @@ async def binance_get_all_my_trades(params: AllMyTradesInput) -> str:
     Pagination:
     `cursor` maps symbol → the last trade id already collected; the walk restarts each
     symbol at that id + 1, so re-running is cheap and never duplicates a fill. Symbols the
-    budget never reached keep whatever position the cursor already held.
+    budget never reached keep whatever position the cursor already held. A symbol that
+    returns **no** trades gets no cursor entry, so every incremental run re-checks it from
+    scratch at 20 weight a time — drop the empties from `symbols` once you know them.
 
     Examples:
     params = {}

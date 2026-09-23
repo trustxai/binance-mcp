@@ -306,12 +306,12 @@ def _sym(symbol: str, base: str, quote: str, status: str = "TRADING") -> dict[st
 
 EXCHANGE_INFO_PAYLOAD: dict[str, Any] = {
     "symbols": [
-        _sym("BTCUSDT", "BTC", "USDT"),  # base is a candidate
-        _sym("BNBBTC", "BNB", "BTC"),  # base is a candidate, quote whitelisted
-        _sym("DOGEUSDT", "DOGE", "USDT"),  # only the QUOTE is a candidate -> still selected
-        _sym("BTCTRY", "BTC", "TRY"),  # candidate base but TRY is not a whitelisted quote
+        _sym("BTCUSDT", "BTC", "USDT"),  # candidate base, whitelisted quote
+        _sym("BNBBTC", "BNB", "BTC"),  # candidate base, quote whitelisted (and a candidate)
+        _sym("DOGEUSDT", "DOGE", "USDT"),  # only the QUOTE is a candidate -> NOT selected
+        _sym("BTCTRY", "BTC", "TRY"),  # candidate base, TRY neither whitelisted nor held
         _sym("SHIBUSDT", "SHIB", "USDT", status="BREAK"),  # delisted: excluded by default
-        _sym("ADAETH", "ADA", "ETH"),  # neither side is a candidate asset
+        _sym("ADAETH", "ADA", "ETH"),  # base is not a candidate asset
     ]
 }
 
@@ -336,14 +336,63 @@ async def test_discover_traded_symbols_happy_path(monkeypatch: pytest.MonkeyPatc
 
     result = await th.binance_discover_traded_symbols(th.DiscoverTradedSymbolsInput())
 
-    assert "**4** candidate asset(s) → **3** symbol(s)" in result
+    assert "**4** candidate asset(s) → **2** symbol(s)" in result
     assert "- assets: BNB, BTC, SHIB, USDT" in result
-    assert "BNBBTC, BTCUSDT, DOGEUSDT" in result
-    assert "BTCTRY" not in result  # quote asset not in the whitelist
+    assert "BNBBTC, BTCUSDT" in result
+    assert "DOGEUSDT" not in result  # only the quote is a candidate — the base decides
+    assert "BTCTRY" not in result  # TRY is neither whitelisted nor a candidate
     assert "SHIBUSDT" not in result  # BREAK, and include_break is False
-    assert "ADAETH" not in result  # neither side is a candidate
-    assert "**60** IP weight" in result
+    assert "ADAETH" not in result  # base is not a candidate
+    assert "**40** IP weight" in result
     assert fake.calls == DISCOVERY_CALLS
+
+
+async def test_discover_traded_symbols_requires_the_base_asset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression guard for the predicate: base ∈ candidates AND quote ∈ (whitelist ∪ candidates).
+
+    Matching on the quote side alone selects every pair quoted in a stablecoin the account
+    merely holds — on the real exchangeInfo, USDT is 493 TRADING pairs (9,860 weight).
+    """
+    routes = dict(DISCOVERY_ROUTES)
+    routes["/api/v3/account"] = {"balances": [{"asset": a, "free": "1", "locked": "0"} for a in ("BTC", "ETH", "USDT")]}
+    routes["/sapi/v3/asset/getUserAsset"] = []
+    routes["/sapi/v1/asset/dribblet"] = {"total": 0, "userAssetDribblets": []}
+    routes["/api/v3/exchangeInfo"] = {
+        "symbols": [
+            _sym("BTCUSDT", "BTC", "USDT"),
+            _sym("ETHUSDT", "ETH", "USDT"),
+            _sym("ETHBTC", "ETH", "BTC"),
+            _sym("SOLUSDT", "SOL", "USDT"),  # quote-only match — excluded
+            _sym("XRPBTC", "XRP", "BTC"),  # quote-only match — excluded
+        ]
+    }
+    fake = _FakeClient(routes=routes)
+    _patch_client(monkeypatch, fake)
+
+    payload = json.loads(
+        await th.binance_discover_traded_symbols(th.DiscoverTradedSymbolsInput(response_format=ResponseFormat.JSON))
+    )
+
+    assert payload["symbols"] == ["BTCUSDT", "ETHBTC", "ETHUSDT"]
+    assert payload["estimated_weight"] == 60
+
+
+async def test_discover_traded_symbols_accepts_a_held_quote_outside_the_whitelist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate quote asset counts even when it is not in `quote_assets` — the rule
+    that hands a {BTC, TRY, USDT} holder their BTCTRY pair back."""
+    fake = _FakeClient(routes=dict(DISCOVERY_ROUTES))
+    _patch_client(monkeypatch, fake)
+
+    payload = json.loads(
+        await th.binance_discover_traded_symbols(
+            th.DiscoverTradedSymbolsInput(extra_assets=["TRY"], response_format=ResponseFormat.JSON)
+        )
+    )
+
+    assert payload["symbols"] == ["BNBBTC", "BTCTRY", "BTCUSDT"]
+    assert "TRY" not in payload["quote_assets"]
 
 
 async def test_discover_traded_symbols_include_break(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -355,8 +404,8 @@ async def test_discover_traded_symbols_include_break(monkeypatch: pytest.MonkeyP
     )
 
     payload = json.loads(result)
-    assert payload["symbols"] == ["BNBBTC", "BTCUSDT", "DOGEUSDT", "SHIBUSDT"]
-    assert payload["estimated_weight"] == 80
+    assert payload["symbols"] == ["BNBBTC", "BTCUSDT", "SHIBUSDT"]
+    assert payload["estimated_weight"] == 60
     assert payload["assets"] == ["BNB", "BTC", "SHIB", "USDT"]
     assert payload["asset_sources"] == {
         "spot balances": 2,
@@ -375,8 +424,11 @@ async def test_discover_traded_symbols_extra_assets_and_quote_filter(monkeypatch
     )
 
     payload = json.loads(result)
-    # Only ETH-quoted symbols survive the whitelist, and ADA became a candidate.
-    assert payload["symbols"] == ["ADAETH"]
+    # `extra_assets` makes ADA a candidate base, so ADAETH appears via the whitelist.
+    # BTCUSDT and BNBBTC survive a whitelist of just ETH because their quote assets are
+    # themselves held: narrowing `quote_assets` prunes pairs quoted in assets the account
+    # does NOT hold, not the ones it does.
+    assert payload["symbols"] == ["ADAETH", "BNBBTC", "BTCUSDT"]
     assert "ADA" in payload["assets"]
     assert payload["quote_assets"] == ["ETH"]
 
@@ -539,7 +591,7 @@ async def test_all_my_trades_error_mid_walk_returns_partial_rows_and_cursor(
 
 async def test_all_my_trades_discovers_symbols_when_not_given(monkeypatch: pytest.MonkeyPatch) -> None:
     routes = dict(DISCOVERY_ROUTES)
-    routes["/api/v3/myTrades"] = _Seq([[_trade(1, symbol="BNBBTC")], [_trade(2)], []])
+    routes["/api/v3/myTrades"] = _Seq([[_trade(1, symbol="BNBBTC")], [_trade(2)]])
     fake = _FakeClient(routes=routes)
     _patch_client(monkeypatch, fake)
 
@@ -547,15 +599,14 @@ async def test_all_my_trades_discovers_symbols_when_not_given(monkeypatch: pytes
 
     payload = json.loads(result)
     assert payload["discovered"] is True
-    assert payload["symbols"] == ["BNBBTC", "BTCUSDT", "DOGEUSDT"]
+    assert payload["symbols"] == ["BNBBTC", "BTCUSDT"]
     assert fake.calls == [
         *DISCOVERY_CALLS,
         _my_trades_call("BNBBTC", 0),
         _my_trades_call("BTCUSDT", 0),
-        _my_trades_call("DOGEUSDT", 0),
     ]
-    assert payload["calls"] == 3
-    assert payload["estimated_weight"] == 60
+    assert payload["calls"] == 2
+    assert payload["estimated_weight"] == 40
     assert payload["count"] == 2
     assert payload["cursor"] == {"BNBBTC": 1, "BTCUSDT": 2}
     assert payload["totals"]["BTCUSDT"] == {
@@ -594,6 +645,36 @@ async def test_all_my_trades_error_path(monkeypatch: pytest.MonkeyPatch) -> None
     assert "_No fills found for these symbols._" in result
 
 
+async def test_all_my_trades_surfaces_a_credential_error_plainly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A RuntimeError with nothing collected is NOT dressed up as a partial walk.
+
+    Missing credentials, the trading kill-switch and a forbidden path all arrive as
+    RuntimeErrors; an empty walk report plus an empty cursor would bury the one thing the
+    caller has to fix.
+    """
+    fake = _FakeClient(exc=RuntimeError("No Binance API key configured. Set BINANCE_API_KEY."))
+    _patch_client(monkeypatch, fake)
+
+    result = await th.binance_get_all_my_trades(th.AllMyTradesInput(symbols=["BTCUSDT"]))
+
+    assert result == "Error: No Binance API key configured. Set BINANCE_API_KEY."
+    assert "All my trades" not in result
+
+
+async def test_all_my_trades_keeps_partial_rows_when_a_runtime_error_lands_mid_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-raise is gated on having collected nothing — rows already fetched still win."""
+    fake = _FakeClient(routes={"/api/v3/myTrades": _Seq([FULL_PAGE, RuntimeError("kill-switch")])})
+    _patch_client(monkeypatch, fake)
+
+    result = await th.binance_get_all_my_trades(th.AllMyTradesInput(symbols=["BTCUSDT"]))
+
+    assert "Stopped on an error after 2 call(s)" in result
+    assert "Error: kill-switch" in result
+    assert '"BTCUSDT": 1000' in result
+
+
 async def test_all_my_trades_rejects_negative_cursor() -> None:
     with pytest.raises(ValidationError, match="a trade id cannot be negative"):
         th.AllMyTradesInput(symbols=["BTCUSDT"], cursor={"BTCUSDT": -1})
@@ -629,3 +710,20 @@ async def test_live_smoke_discover_traded_symbols() -> None:
     assert isinstance(result, str)
     assert not result.startswith("Error")
     assert "# Traded-symbol candidates" in result
+
+
+@pytest.mark.live
+async def test_live_smoke_all_my_trades_bounded() -> None:
+    """The walk against the real account, bounded to ONE page of ONE symbol.
+
+    `max_weight=20` buys exactly one myTrades call, so this costs 20 IP weight of the
+    6000/min budget however much history the account has — no discovery, no fan-out. An
+    account with more than 1000 BTCUSDT fills stops on the budget and says so, which is
+    still a pass: the point is that the walk, the cursor and the rendering work live.
+    """
+    result = await th.binance_get_all_my_trades(th.AllMyTradesInput(symbols=["BTCUSDT"], max_weight=20))
+
+    assert isinstance(result, str)
+    assert not result.startswith("Error")
+    assert "# All my trades" in result
+    assert "## Cursor" in result
