@@ -451,6 +451,13 @@ async def binance_get_pay_transactions(params: PayTransactionsInput) -> str:
         return handle_api_error(exc)
 
 
+def _empty_walk(note: str, fmt: ResponseFormat) -> str:
+    """The walk made no request: one uniform shape for both formats."""
+    if fmt is ResponseFormat.JSON:
+        return clip_response(to_json({"title": "Binance Pay History", "count": 0, "items": [], "note": note}))
+    return clip_response(f"# Binance Pay History\n\n_{note}_")
+
+
 def _render_pay_history(
     transactions: list[dict[str, Any]],
     *,
@@ -627,29 +634,18 @@ async def binance_get_pay_history(params: PayHistoryInput) -> str:
                 f"18-month Pay lookback ({epoch_to_human(lookback_floor_ms)}) — nothing in it is "
                 "retrievable via the API."
             )
-            if params.response_format is ResponseFormat.JSON:
-                return to_json({"title": "Binance Pay History", "count": 0, "items": [], "error": note})
-            return f"# Binance Pay History\n\n_{note}_"
+            return _empty_walk(note, params.response_format)
         since_clamped = since_input is not None and since_input < lookback_floor_ms
         since_ms = lookback_floor_ms if since_input is None or since_clamped else since_input
 
         if since_ms >= until_ms:
+            # Unreachable with a clamped `since` (the floor is strictly below `until` here),
+            # so this only ever reports the caller's own bounds.
             note = (
-                f"No window to walk: since ({epoch_to_human(since_ms)}"
-                f"{', clamped to the lookback' if since_clamped else ''}) is not before the upper bound "
+                f"No window to walk: since ({epoch_to_human(since_ms)}) is not before the upper bound "
                 f"({epoch_to_human(until_ms)})."
             )
-            if params.response_format is ResponseFormat.JSON:
-                return to_json(
-                    {
-                        "title": "Binance Pay History",
-                        "count": 0,
-                        "items": [],
-                        "since_clamped": since_clamped,
-                        "note": note,
-                    }
-                )
-            return f"# Binance Pay History\n\n_{note}_"
+            return _empty_walk(note, params.response_format)
 
         client = get_client()
         result = await _walk_pay_history(client, since_ms, until_ms, params.max_calls)

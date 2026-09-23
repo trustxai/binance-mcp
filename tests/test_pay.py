@@ -423,8 +423,12 @@ async def test_pay_history_no_window_when_since_after_until() -> None:
     params = PayHistoryInput(since=2_000_000, resume_before=1_000_000)
 
     result = await binance_get_pay_history(params)
+    js = json.loads(
+        await binance_get_pay_history(PayHistoryInput(since=2_000_000, resume_before=1_000_000, response_format="json"))
+    )
 
     assert "No window to walk" in result
+    assert js["count"] == 0 and js["items"] == [] and "No window to walk" in js["note"]
 
 
 async def test_pay_history_json_format(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -733,4 +737,4 @@ async def test_pay_history_range_entirely_before_lookback_is_refused_locally(mon
 
     assert fake.calls == []  # never sent: it would be a permanent 400
     assert "older than Binance's 18-month Pay lookback" in md
-    assert js["count"] == 0 and "older than Binance's 18-month Pay lookback" in js["error"]
+    assert js["count"] == 0 and "older than Binance's 18-month Pay lookback" in js["note"]
