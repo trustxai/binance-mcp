@@ -1,10 +1,11 @@
 """Print the README's "Available Tools" table from the live registry.
 
-Usage: `uv run python scripts/gen_tool_table.py [--check]`
+Usage: `uv run python scripts/gen_tool_table.py [--check | --write]`
 
 Groups tools by module in board order and takes each tool's first docstring
-line as its description, so the README can never drift from the code. `--check`
-exits 1 when README.md does not contain the generated table verbatim.
+line as its description, so the README can never drift from the code. The table
+lives between `<!-- TOOL TABLE START -->` / `<!-- TOOL TABLE END -->` markers in
+README.md: `--write` replaces it in place, `--check` exits 1 when it is stale.
 """
 
 from __future__ import annotations
@@ -77,13 +78,28 @@ def build_table() -> str:
     return header + "\n\n" + "\n".join(lines) + "\n"
 
 
+START = "<!-- TOOL TABLE START -->"
+END = "<!-- TOOL TABLE END -->"
+
+
+def _splice(readme: str, table: str) -> str:
+    head, _, rest = readme.partition(START)
+    _, _, tail = rest.partition(END)
+    if not head or not tail:
+        raise SystemExit(f"README.md lacks the {START} / {END} markers")
+    return f"{head}{START}\n{table}{END}{tail}"
+
+
 def main() -> int:
     table = build_table()
+    readme_path = Path(__file__).resolve().parents[1] / "README.md"
     if "--check" in sys.argv:
-        readme = Path(__file__).resolve().parents[1] / "README.md"
-        if table.strip() not in readme.read_text():
-            sys.stderr.write("README.md tool table is stale — regenerate with scripts/gen_tool_table.py\n")
+        if _splice(readme_path.read_text(), table) != readme_path.read_text():
+            sys.stderr.write("README.md tool table is stale — run scripts/gen_tool_table.py --write\n")
             return 1
+        return 0
+    if "--write" in sys.argv:
+        readme_path.write_text(_splice(readme_path.read_text(), table))
         return 0
     sys.stdout.write(table)
     return 0
