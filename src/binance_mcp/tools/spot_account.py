@@ -569,8 +569,7 @@ async def binance_get_prevented_matches(params: _PreventedMatchesInput) -> str:
     ),
 )
 async def binance_get_allocations(params: _AllocationsInput) -> str:
-    """List Smart Order Routing (SOR) allocations — the per-symbol fills that make
-    up an SOR order's execution.
+    """List Smart Order Routing (SOR) allocations — the per-symbol fills behind an SOR order.
 
     Calls `GET /api/v3/myAllocations` (SIGNED, USER_DATA). IP weight 20 per call.
 
