@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
+import httpx
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -46,18 +47,27 @@ _HISTORY_KIND_META: dict[str, tuple[str, int]] = {
 # "recent 30-day data" default both endpoints fall back to when begin/end are omitted).
 _WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
+# HTTP statuses that narrowing the time window would NOT fix (auth / rate limit) —
+# these must propagate immediately instead of burning the budget on a fallback retry.
+_UNRECOVERABLE_STATUS_CODES = frozenset({401, 403, 418, 429})
 
-def _to_ms(value: int | str) -> int:
-    """Accept an epoch-ms int or an ISO-8601 string (tool surface) and return epoch ms."""
+
+def _to_ms(value: int | str, *, field: str) -> int:
+    """Accept an epoch-ms int, an epoch-ms numeric string (>=12 digits), or an
+    ISO-8601 string (tool surface) and return epoch ms.
+
+    Raises `ValueError` naming `field` when `value` matches none of those shapes.
+    """
     if isinstance(value, int):
         return value
     text = value.strip()
-    if text.endswith("Z"):
-        text = f"{text[:-1]}+00:00"
+    if text.isdigit() and len(text) >= 12:
+        return int(text)
+    iso_text = f"{text[:-1]}+00:00" if text.endswith("Z") else text
     try:
-        parsed = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(iso_text)
     except ValueError as exc:
-        raise ValueError(f"Invalid timestamp {value!r}: expected epoch milliseconds or an ISO-8601 string.") from exc
+        raise ValueError(f"{field} must be epoch milliseconds or an ISO-8601 string, got {value!r}.") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return int(parsed.timestamp() * 1000)
@@ -114,6 +124,54 @@ def _sum_by_currency(rows: list[dict[str, Any]], *, amount_field: str, currency_
     return totals
 
 
+def _dedupe_by_order_no(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Dedupe by `orderNo` (a later occurrence wins); rows without one are kept as-is.
+
+    Overlapping fetches are expected here — resuming a walk re-touches the inclusive
+    `endTime` boundary, and a mid-window retry re-walks the whole window — so this
+    always runs before rows are returned.
+    """
+    by_order_no: dict[str, dict[str, Any]] = {}
+    unkeyed: list[dict[str, Any]] = []
+    for row in rows:
+        order_no = row.get("orderNo")
+        if order_no is None:
+            unkeyed.append(row)
+        else:
+            by_order_no[str(order_no)] = row
+    return [*by_order_no.values(), *unkeyed]
+
+
+def _markdown_truncation_note(display_cap: int, total_on_page: int, next_page: int) -> str:
+    return (
+        f"\n\n_[display capped at {display_cap} of {total_on_page} rows fetched on this page — "
+        f'pass `response_format="json"` for all of them, or `page={next_page}` for the next page.]_'
+    )
+
+
+class _WalkError(RuntimeError):
+    """Raised by `_walk_span` when a request fails, carrying whatever rows were
+    already collected and exactly how many calls were spent (including the failed
+    one) before the failure — so the caller never has to guess or under/over-count
+    the budget already spent.
+    """
+
+    def __init__(self, cause: Exception, rows: list[dict[str, Any]], calls_made: int) -> None:
+        self.cause = cause
+        self.rows = rows
+        self.calls_made = calls_made
+        super().__init__(str(cause))
+
+
+def _is_recoverable(cause: Exception) -> bool:
+    """True for an HTTP error plausibly caused by an over-wide time span (worth
+    retrying with a narrower window, e.g. -1127); False for auth/rate-limit/any
+    non-HTTP failure that narrowing the window would not fix, and that must
+    propagate immediately instead of burning the budget on a doomed retry.
+    """
+    return isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code not in _UNRECOVERABLE_STATUS_CODES
+
+
 class FiatOrdersInput(BaseModel):
     """Input for `binance_get_fiat_orders` (`GET /sapi/v1/fiat/orders`)."""
 
@@ -125,12 +183,12 @@ class FiatOrdersInput(BaseModel):
     )
     begin_time: int | str | None = Field(
         default=None,
-        description="Window start — epoch ms or ISO-8601. API name `beginTime`. Omit both begin/end for "
-        "the API default of the most recent 30 days.",
+        description="Window start — epoch ms, an epoch-ms numeric string, or ISO-8601. API name `beginTime`. "
+        "Omit both begin/end for the API default of the most recent 30 days.",
     )
     end_time: int | str | None = Field(
         default=None,
-        description="Window end — epoch ms or ISO-8601. API name `endTime`.",
+        description="Window end — epoch ms, an epoch-ms numeric string, or ISO-8601. API name `endTime`.",
     )
     page: int = Field(default=1, ge=1, description="1-indexed page number, passed through as `page`.")
     rows: int = Field(default=100, ge=1, le=500, description="Rows per page, passed through as `rows` (max 500).")
@@ -148,12 +206,12 @@ class FiatPaymentsInput(BaseModel):
     )
     begin_time: int | str | None = Field(
         default=None,
-        description="Window start — epoch ms or ISO-8601. API name `beginTime`. Omit both begin/end for "
-        "the API default of the most recent 30 days.",
+        description="Window start — epoch ms, an epoch-ms numeric string, or ISO-8601. API name `beginTime`. "
+        "Omit both begin/end for the API default of the most recent 30 days.",
     )
     end_time: int | str | None = Field(
         default=None,
-        description="Window end — epoch ms or ISO-8601. API name `endTime`.",
+        description="Window end — epoch ms, an epoch-ms numeric string, or ISO-8601. API name `endTime`.",
     )
     page: int = Field(default=1, ge=1, description="1-indexed page number, passed through as `page`.")
     rows: int = Field(default=100, ge=1, le=500, description="Rows per page, passed through as `rows` (max 500).")
@@ -167,27 +225,29 @@ class FiatHistoryInput(BaseModel):
 
     kind: Literal["deposits", "withdrawals", "buys", "sells"] = Field(
         description="Which fiat history to walk: deposits/withdrawals hit `fiat/orders` (UID 45000/call, "
-        "at most 4 calls/min); buys/sells hit `fiat/payments` (IP 1/call, cheap)."
+        "default budget 4 calls/min); buys/sells hit `fiat/payments` (IP 1/call, default budget 20)."
     )
     since: int | str = Field(
         default="2017-07-01",
-        description="Earliest point to walk back to — epoch ms or ISO-8601. Default is Binance's fiat-rail "
-        "launch date; there is no account-creation endpoint to derive a tighter bound.",
+        description="Earliest point to walk back to — epoch ms, an epoch-ms numeric string, or ISO-8601. "
+        "Default is Binance's fiat-rail launch date; there is no account-creation endpoint to derive a "
+        "tighter bound.",
     )
     resume_before: int | str | None = Field(
         default=None,
-        description="Epoch ms or ISO-8601 cursor copied from a previous call's `resume_before` output. When "
-        "set, only rows strictly before this point are fetched, continuing a budget-exhausted walk. Omit "
-        "to start from now.",
+        description="Epoch ms, an epoch-ms numeric string, or ISO-8601 cursor copied from a previous call's "
+        "`resume_before` output. Used as the new `endTime` to continue a walk that stopped early — Binance "
+        "treats `endTime` as inclusive, so the boundary row may be re-fetched; rows are deduped by `orderNo` "
+        "before being returned. Omit to start from now.",
     )
     rows: int = Field(default=100, ge=1, le=500, description="Page size passed to Binance as `rows` (max 500).")
-    max_calls: int = Field(
-        default=20,
+    max_calls: int | None = Field(
+        default=None,
         ge=1,
         le=200,
-        description="Hard cap on API calls this invocation makes. For kind=deposits/withdrawals each call "
-        "costs UID 45000 of the 180000/min budget (at most 4/min) — pass a small max_calls (e.g. 4) for "
-        "those; buys/sells cost IP 1 and can afford the default.",
+        description="Hard cap on API calls this invocation makes. Defaults to 4 for kind=deposits/withdrawals "
+        "(each call costs UID 45000 of the 180000/min budget — 4 calls spends it for the minute) and 20 for "
+        "kind=buys/sells (IP 1/call, cheap). Pass an explicit value to override either default.",
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="markdown or json output.")
 
@@ -230,7 +290,8 @@ async def binance_get_fiat_orders(params: FiatOrdersInput) -> str:
     Pagination:
     `page` (1-indexed) / `rows` (max 500) map directly to the API; the response also
     reports Binance's own `total` row count across all pages. Markdown display is
-    capped at 50 rows; JSON keeps the full page.
+    capped at 50 rows (with a note naming the next `page` to request); JSON keeps
+    the full page.
 
     Examples:
     params = {"transaction_type": "deposit", "rows": 50}
@@ -239,7 +300,9 @@ async def binance_get_fiat_orders(params: FiatOrdersInput) -> str:
     Error Handling:
     A 200 body with `success: false` is raised by the client as `BinanceEnvelopeError`
     and surfaced here as `Error: ...`; an undocumented span cap on this endpoint
-    typically surfaces as -1127 — narrow begin_time/end_time and retry.
+    typically surfaces as -1127 — narrow begin_time/end_time and retry. A malformed
+    begin_time/end_time returns `Error: <field> must be epoch milliseconds or an
+    ISO-8601 string` without calling the API.
     """
     try:
         client = get_client()
@@ -249,16 +312,16 @@ async def binance_get_fiat_orders(params: FiatOrdersInput) -> str:
             "rows": params.rows,
         }
         if params.begin_time is not None:
-            api_params["beginTime"] = _to_ms(params.begin_time)
+            api_params["beginTime"] = _to_ms(params.begin_time, field="begin_time")
         if params.end_time is not None:
-            api_params["endTime"] = _to_ms(params.end_time)
+            api_params["endTime"] = _to_ms(params.end_time, field="end_time")
         resp = await client.request("GET", _ORDERS_PATH, params=api_params, auth="signed")
         body: dict[str, Any] = resp.json()
         data: list[dict[str, Any]] = body.get("data") or []
         total_raw = body.get("total")
         total = int(total_raw) if isinstance(total_raw, int) else None
         display_items = data if params.response_format is ResponseFormat.JSON else data[:MAX_DISPLAY_ROWS]
-        return paginated_response(
+        response = paginated_response(
             items=display_items,
             limit=params.rows,
             offset=(params.page - 1) * params.rows,
@@ -267,6 +330,11 @@ async def binance_get_fiat_orders(params: FiatOrdersInput) -> str:
             title="Binance Fiat Deposit/Withdraw Orders",
             total=total,
         )
+        if params.response_format is not ResponseFormat.JSON and len(data) > MAX_DISPLAY_ROWS:
+            response += _markdown_truncation_note(MAX_DISPLAY_ROWS, len(data), params.page + 1)
+        return response
+    except ValueError as exc:
+        return f"Error: {exc}"
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -309,7 +377,8 @@ async def binance_get_fiat_payments(params: FiatPaymentsInput) -> str:
     Pagination:
     `page` (1-indexed) / `rows` (max 500) map directly to the API; the response also
     reports Binance's own `total` row count across all pages. Markdown display is
-    capped at 50 rows; JSON keeps the full page.
+    capped at 50 rows (with a note naming the next `page` to request); JSON keeps
+    the full page.
 
     Examples:
     params = {"transaction_type": "buy", "rows": 50}
@@ -317,7 +386,9 @@ async def binance_get_fiat_payments(params: FiatPaymentsInput) -> str:
 
     Error Handling:
     A 200 body with `success: false` is raised by the client as `BinanceEnvelopeError`
-    and surfaced here as `Error: ...`.
+    and surfaced here as `Error: ...`. A malformed begin_time/end_time returns
+    `Error: <field> must be epoch milliseconds or an ISO-8601 string` without calling
+    the API.
     """
     try:
         client = get_client()
@@ -327,16 +398,16 @@ async def binance_get_fiat_payments(params: FiatPaymentsInput) -> str:
             "rows": params.rows,
         }
         if params.begin_time is not None:
-            api_params["beginTime"] = _to_ms(params.begin_time)
+            api_params["beginTime"] = _to_ms(params.begin_time, field="begin_time")
         if params.end_time is not None:
-            api_params["endTime"] = _to_ms(params.end_time)
+            api_params["endTime"] = _to_ms(params.end_time, field="end_time")
         resp = await client.request("GET", _PAYMENTS_PATH, params=api_params, auth="signed")
         body: dict[str, Any] = resp.json()
         data: list[dict[str, Any]] = body.get("data") or []
         total_raw = body.get("total")
         total = int(total_raw) if isinstance(total_raw, int) else None
         display_items = data if params.response_format is ResponseFormat.JSON else data[:MAX_DISPLAY_ROWS]
-        return paginated_response(
+        response = paginated_response(
             items=display_items,
             limit=params.rows,
             offset=(params.page - 1) * params.rows,
@@ -345,6 +416,11 @@ async def binance_get_fiat_payments(params: FiatPaymentsInput) -> str:
             title="Binance Fiat Buy/Sell Payments",
             total=total,
         )
+        if params.response_format is not ResponseFormat.JSON and len(data) > MAX_DISPLAY_ROWS:
+            response += _markdown_truncation_note(MAX_DISPLAY_ROWS, len(data), params.page + 1)
+        return response
+    except ValueError as exc:
+        return f"Error: {exc}"
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -387,22 +463,29 @@ async def _walk_span(
     max_calls: int,
     calls_made: int,
 ) -> tuple[list[dict[str, Any]], int, bool]:
-    """Page through one [begin_ms, end_ms] span with `page`.
+    """Page through one [begin_ms, end_ms] span with `page`, checking the budget
+    before every request (a request that itself errors still spends one call).
 
-    Returns (collected rows, updated calls_made, budget_exhausted).
+    Returns (collected rows, updated calls_made, budget_exhausted) on success.
+    Raises `_WalkError` — carrying the rows collected and the real call count
+    (including the failed request) — if a request fails.
     """
     collected: list[dict[str, Any]] = []
     page = 1
     while calls_made < max_calls:
-        data = await _fetch_history_page(
-            client,
-            endpoint=endpoint,
-            transaction_type=transaction_type,
-            begin_ms=begin_ms,
-            end_ms=end_ms,
-            page=page,
-            rows=rows,
-        )
+        try:
+            data = await _fetch_history_page(
+                client,
+                endpoint=endpoint,
+                transaction_type=transaction_type,
+                begin_ms=begin_ms,
+                end_ms=end_ms,
+                page=page,
+                rows=rows,
+            )
+        except Exception as exc:
+            calls_made += 1  # the failed request still spent one call of the budget
+            raise _WalkError(exc, collected, calls_made) from exc
         calls_made += 1
         collected.extend(data)
         if len(data) < rows:
@@ -425,13 +508,22 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
     """Walk fiat deposit/withdraw or buy/sell history across pages and time windows.
 
     Tries ONE call spanning `beginTime=since` .. `endTime=now` (or `resume_before` when
-    resuming) and pages `page` until a short page signals the end. If Binance errors on
-    that wide span (commonly -1127, an undocumented span cap on these two endpoints),
-    falls back to walking 30-day windows newest-first instead. Honors a `max_calls`
-    budget (default 20) so one invocation can never blow past the weight-limited call
-    rate — deposits/withdrawals cost UID 45000/call (≤4/min!), buys/sells cost IP 1/call.
-    When the budget runs out it stops and returns a `resume_before` cursor to pass back
-    in on the next call to continue further into the past.
+    resuming) and pages `page` until a short page signals the end. If that wide-span
+    attempt fails with a plausibly span-related HTTP error (commonly -1127, an
+    undocumented span cap on these two endpoints), falls back to walking 30-day windows
+    newest-first instead. An auth, rate-limit, envelope (`success: false`), or other
+    non-HTTP failure is NOT treated as span-related and propagates immediately as
+    `Error: ...` — retrying with a narrower window would not fix it.
+
+    Honors a `max_calls` budget so one invocation can never blow past the weight-limited
+    call rate — deposits/withdrawals cost UID 45000/call (default budget 4, i.e. the
+    whole 180000/min UID budget for a minute), buys/sells cost IP 1/call (default budget
+    20). Every request checks the budget first, and a request that itself errors still
+    counts against it, since it still spent real quota. When the budget runs out — or a
+    span-related error interrupts a window partway through — the walk stops and returns
+    whatever rows it already collected plus a `resume_before` cursor: the boundary of
+    the next unfetched range. Binance treats `endTime` as inclusive, so the boundary row
+    may come back again on resume; rows are deduped by `orderNo` before being returned.
 
     Status values Binance returns for fiat orders/payments: Processing, Failed,
     Successful, Finished, Refunding, Refunded, Refund Failed, Order Partial credit
@@ -449,34 +541,44 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
       "Credit Card" `paymentMethod` in `buys`/`sells` is a bank card, not the Binance Card.
 
     Returns:
-    Rows sorted newest-first (display capped at 50, JSON keeps the full walked set), a
-    per-fiat-currency total (and, for buys/sells, a per-crypto-currency received total),
-    how many API calls were spent, whether the window fallback triggered, and — when the
-    budget ran out — a `resume_before` cursor.
+    Deduped rows sorted newest-first (display capped at 50, JSON keeps the full walked
+    set), a per-fiat-currency total (and, for buys/sells, a per-crypto-currency received
+    total), how many API calls were spent, whether the window fallback triggered, and —
+    when the walk stopped early — a `resume_before` cursor.
 
     Examples:
-    params = {"kind": "deposits", "max_calls": 4}
+    params = {"kind": "deposits"}
     params = {"kind": "buys", "since": "2023-01-01"}
-    params = {"kind": "withdrawals", "resume_before": 1700000000000, "max_calls": 4}
+    params = {"kind": "withdrawals", "resume_before": 1700000000000}
 
     Error Handling:
-    An error on the wide-span attempt triggers the 30-day-window fallback automatically;
-    any other failure (bad signature, rate limit) is surfaced as `Error: ...` and nothing
-    already fetched from prior successful calls is discarded from the current response.
+    A span-related HTTP error on the wide-span attempt triggers the 30-day-window
+    fallback automatically; the same kind of error partway through a window stops the
+    walk early — rows collected so far are still returned, with a `resume_before`
+    cursor — instead of discarding them. Any other failure (bad signature, rate limit,
+    `success: false` envelope) propagates immediately as `Error: ...` with no fallback
+    attempt, since narrowing the window would not fix it. A malformed since/resume_before
+    returns `Error: <field> must be epoch milliseconds or an ISO-8601 string`.
     """
     try:
         client = get_client()
         endpoint, transaction_type = _HISTORY_KIND_META[params.kind]
         is_payment = params.kind in ("buys", "sells")
         formatter = _format_fiat_payment if is_payment else _format_fiat_order
+        max_calls = params.max_calls if params.max_calls is not None else (20 if is_payment else 4)
 
-        since_ms = _to_ms(params.since)
-        end_ms = _to_ms(params.resume_before) if params.resume_before is not None else int(time.time() * 1000)
+        since_ms = _to_ms(params.since, field="since")
+        end_ms = (
+            _to_ms(params.resume_before, field="resume_before")
+            if params.resume_before is not None
+            else int(time.time() * 1000)
+        )
 
         all_rows: list[dict[str, Any]] = []
         calls_made = 0
         budget_exhausted = False
         used_fallback = False
+        resume_before_ms: int | None = None
 
         try:
             all_rows, calls_made, budget_exhausted = await _walk_span(
@@ -486,42 +588,56 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
                 begin_ms=since_ms,
                 end_ms=end_ms,
                 rows=params.rows,
-                max_calls=params.max_calls,
+                max_calls=max_calls,
                 calls_made=0,
             )
-        except Exception:
-            # The wide-span call still spent one call of the budget even though it
-            # errored — count it before switching strategy.
+            if budget_exhausted:
+                # Page order within the wide span is undocumented, so there is no safe
+                # partial boundary — the whole span must be retried with a bigger budget.
+                resume_before_ms = end_ms
+        except _WalkError as werr:
+            if not _is_recoverable(werr.cause):
+                raise werr.cause from werr
             used_fallback = True
-            all_rows = []
-            calls_made = 1
-            budget_exhausted = False
+            all_rows = werr.rows
+            calls_made = werr.calls_made
 
         if used_fallback:
             window_end = end_ms
-            while window_end >= since_ms and calls_made < params.max_calls:
+            while window_end >= since_ms:
+                if calls_made >= max_calls:
+                    budget_exhausted = True
+                    resume_before_ms = window_end
+                    break
                 window_start = max(since_ms, window_end - _WINDOW_MS)
-                window_rows, calls_made, budget_exhausted = await _walk_span(
-                    client,
-                    endpoint=endpoint,
-                    transaction_type=transaction_type,
-                    begin_ms=window_start,
-                    end_ms=window_end,
-                    rows=params.rows,
-                    max_calls=params.max_calls,
-                    calls_made=calls_made,
-                )
+                try:
+                    window_rows, calls_made, window_exhausted = await _walk_span(
+                        client,
+                        endpoint=endpoint,
+                        transaction_type=transaction_type,
+                        begin_ms=window_start,
+                        end_ms=window_end,
+                        rows=params.rows,
+                        max_calls=max_calls,
+                        calls_made=calls_made,
+                    )
+                except _WalkError as werr:
+                    if not _is_recoverable(werr.cause):
+                        raise werr.cause from werr
+                    all_rows.extend(werr.rows)
+                    calls_made = werr.calls_made
+                    budget_exhausted = True
+                    resume_before_ms = window_end
+                    break
                 all_rows.extend(window_rows)
-                if budget_exhausted:
+                if window_exhausted:
+                    budget_exhausted = True
+                    resume_before_ms = window_end  # redo this same window on resume
                     break
                 window_end = window_start - 1
 
+        all_rows = _dedupe_by_order_no(all_rows)
         all_rows.sort(key=lambda row: int(row.get("createTime") or 0), reverse=True)
-
-        resume_before_ms: int | None = None
-        if budget_exhausted and all_rows:
-            oldest = min(int(row.get("createTime") or 0) for row in all_rows)
-            resume_before_ms = oldest - 1
 
         amount_field = "sourceAmount" if is_payment else "amount"
         totals = _sum_by_currency(all_rows, amount_field=amount_field, currency_field="fiatCurrency")
@@ -555,7 +671,7 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
         ]
         if budget_exhausted:
             lines.append(
-                f"⚠️ Stopped early — the `max_calls` budget ({params.max_calls}) ran out. "
+                f"⚠️ Stopped early — the `max_calls` budget ({max_calls}) ran out. "
                 f"Rows before {epoch_to_human(resume_before_ms)} were not fetched; call again with "
                 f"`resume_before={resume_before_ms}` to continue."
             )
@@ -581,5 +697,7 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
         if not all_rows:
             lines.append("_No items._")
         return clip_response("\n".join(lines))
+    except ValueError as exc:
+        return f"Error: {exc}"
     except Exception as exc:
         return handle_api_error(exc)

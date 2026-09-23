@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -10,6 +11,8 @@ import pytest
 from pydantic import ValidationError
 
 from binance_mcp.tools.fiat import (
+    _WINDOW_MS,
+    MAX_DISPLAY_ROWS,
     FiatHistoryInput,
     FiatOrdersInput,
     FiatPaymentsInput,
@@ -132,7 +135,10 @@ async def test_fiat_orders_withdraw_with_iso_window_as_json(monkeypatch: pytest.
     )
 
     assert '"orderNo": "O2"' in result
-    _, _, kwargs = fake.calls[0]
+    method, path, kwargs = fake.calls[0]
+    assert method == "GET"
+    assert path == "/sapi/v1/fiat/orders"
+    assert kwargs["auth"] == "signed"
     assert kwargs["params"] == {
         "transactionType": 1,
         "page": 1,
@@ -140,6 +146,42 @@ async def test_fiat_orders_withdraw_with_iso_window_as_json(monkeypatch: pytest.
         "beginTime": 1706745600000,
         "endTime": 1706832000000,
     }
+
+
+async def test_fiat_orders_accepts_numeric_string_begin_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    envelope = _orders_envelope([_order_row("O3", "1.00", "USD", 1700000000000)], total=1)
+    fake = _FakeClient(queue=[envelope])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    await binance_get_fiat_orders(FiatOrdersInput(transaction_type="deposit", begin_time="1700000000000"))
+
+    _, _, kwargs = fake.calls[0]
+    assert kwargs["params"]["beginTime"] == 1700000000000
+
+
+async def test_fiat_orders_malformed_begin_time_returns_error_without_calling_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(queue=[])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_orders(FiatOrdersInput(transaction_type="deposit", begin_time="not-a-date"))
+
+    assert result.startswith("Error: begin_time must be epoch milliseconds or an ISO-8601 string")
+    assert fake.calls == []
+
+
+async def test_fiat_orders_display_truncation_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [_order_row(f"O{i}", "1.00", "USD", 1700000000000 + i) for i in range(60)]
+    envelope = _orders_envelope(rows, total=60)
+    fake = _FakeClient(queue=[envelope])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_orders(FiatOrdersInput(transaction_type="deposit", rows=60))
+
+    assert result.count("- **O") == MAX_DISPLAY_ROWS
+    assert "display capped at 50 of 60 rows fetched on this page" in result
+    assert "page=2" in result
 
 
 async def test_fiat_orders_error_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,6 +206,14 @@ def test_fiat_orders_rejects_unknown_transaction_type() -> None:
         FiatOrdersInput(transaction_type="bogus")  # type: ignore[arg-type]
 
 
+@pytest.mark.live
+async def test_fiat_orders_live_smoke() -> None:
+    """Live smoke: read-only, needs BINANCE_API_KEY + secret/PEM in the environment.
+    Not runnable on the spot testnet — /sapi does not exist there."""
+    result = await binance_get_fiat_orders(FiatOrdersInput(transaction_type="deposit", rows=1))
+    assert not result.startswith("Error: unexpected failure")
+
+
 # ------------------------------------------------------------------------- payments
 
 
@@ -181,7 +231,10 @@ async def test_fiat_payments_buy_happy_path(monkeypatch: pytest.MonkeyPatch) -> 
     assert "500 USD" in result
     assert "0.01 BTC" in result
     assert "via Credit Card" in result
-    _, _, kwargs = fake.calls[0]
+    method, path, kwargs = fake.calls[0]
+    assert method == "GET"
+    assert path == "/sapi/v1/fiat/payments"
+    assert kwargs["auth"] == "signed"
     assert kwargs["params"] == {"transactionType": 0, "page": 1, "rows": 100}
 
 
@@ -197,7 +250,10 @@ async def test_fiat_payments_sell_has_no_payment_method_note(monkeypatch: pytest
 
     assert "**P2**" in result
     assert " via " not in result
-    _, _, kwargs = fake.calls[0]
+    method, path, kwargs = fake.calls[0]
+    assert method == "GET"
+    assert path == "/sapi/v1/fiat/payments"
+    assert kwargs["auth"] == "signed"
     assert kwargs["params"]["transactionType"] == 1
 
 
@@ -208,6 +264,14 @@ async def test_fiat_payments_error_path(monkeypatch: pytest.MonkeyPatch) -> None
     result = await binance_get_fiat_payments(FiatPaymentsInput(transaction_type="buy"))
 
     assert result.startswith("Error (401)")
+
+
+@pytest.mark.live
+async def test_fiat_payments_live_smoke() -> None:
+    """Live smoke: read-only, needs BINANCE_API_KEY + secret/PEM in the environment.
+    Not runnable on the spot testnet — /sapi does not exist there."""
+    result = await binance_get_fiat_payments(FiatPaymentsInput(transaction_type="buy", rows=1))
+    assert not result.startswith("Error: unexpected failure")
 
 
 # --------------------------------------------------------------------------- history
@@ -226,8 +290,10 @@ async def test_fiat_history_single_call_totals_and_sort(monkeypatch: pytest.Monk
     result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", rows=100))
 
     assert len(fake.calls) == 1
-    _, path, kwargs = fake.calls[0]
+    method, path, kwargs = fake.calls[0]
+    assert method == "GET"
     assert path == "/sapi/v1/fiat/orders"
+    assert kwargs["auth"] == "signed"
     assert kwargs["params"]["transactionType"] == 0
     assert "Fetched **3** row(s) across **1** API call(s)." in result
     assert "USD: 15" in result
@@ -248,7 +314,10 @@ async def test_fiat_history_pages_within_span(monkeypatch: pytest.MonkeyPatch) -
     result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", rows=2, max_calls=10))
 
     assert len(fake.calls) == 2
-    assert fake.calls[0][2]["params"]["page"] == 1
+    method0, _, kwargs0 = fake.calls[0]
+    assert method0 == "GET"
+    assert kwargs0["auth"] == "signed"
+    assert kwargs0["params"]["page"] == 1
     assert fake.calls[1][2]["params"]["page"] == 2
     assert "Fetched **3** row(s) across **2** API call(s)." in result
 
@@ -270,25 +339,91 @@ async def test_fiat_history_falls_back_to_windows_on_error(monkeypatch: pytest.M
     result = await binance_get_fiat_history(FiatHistoryInput(kind="buys", since=recent_since_ms, max_calls=10))
 
     assert len(fake.calls) == 2
+    assert fake.calls[1][2]["auth"] == "signed"
+    assert fake.calls[1][1] == "/sapi/v1/fiat/payments"
     assert "fell back to 30-day windows" in result
     assert "**B1**" in result
     assert "Totals by crypto currency received:" in result
     assert "BTC: 0.002" in result
 
 
-async def test_fiat_history_budget_exhausted_returns_resume_before(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fiat_history_unrecoverable_error_propagates_without_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(queue=[_status_error("/sapi/v1/fiat/orders", 401, {"code": -2015, "msg": "Invalid API-key."})])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", max_calls=10))
+
+    assert len(fake.calls) == 1  # no fallback retry attempted — auth errors are not span-related
+    assert result.startswith("Error (401)")
+    assert "fell back" not in result
+
+
+async def test_fiat_history_wide_span_budget_exhausted_resumes_at_end(monkeypatch: pytest.MonkeyPatch) -> None:
     full_page = _orders_envelope(
         [_order_row("H1", "1.00", "USD", 1700000000000), _order_row("H2", "1.00", "USD", 1700000001000)], total=99
     )
     fake = _FakeClient(queue=[full_page])
     monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
 
+    before = int(time.time() * 1000)
     result = await binance_get_fiat_history(FiatHistoryInput(kind="withdrawals", rows=2, max_calls=1))
+    after = int(time.time() * 1000)
 
     assert len(fake.calls) == 1
     assert "Stopped early" in result
-    # oldest createTime fetched (H1 = 1700000000000) minus 1 ms.
-    assert "resume_before=1699999999999" in result
+    # Page order within a single wide span is undocumented, so there is no safe
+    # narrower boundary — resume_before falls back to the original end (now).
+    match = re.search(r"resume_before=(\d+)", result)
+    assert match is not None
+    assert before <= int(match.group(1)) <= after
+
+
+async def test_fiat_history_window_budget_exhaustion_and_resume_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exact blocking repro: max_calls=2, the wide-span attempt errors (1 call),
+    one 30-day window succeeds with a short page (2nd call) — the walk must stop
+    there (not claim to have covered everything back to `since`) and must emit a
+    `resume_before` equal to the boundary of the next, still-unfetched window. The
+    emitted cursor is then chained into a fresh call to prove it is actually usable.
+    """
+    since_ms = 1_000_000_000_000
+    initial_end_ms = 1_700_000_000_000
+
+    span_error = _status_error("/sapi/v1/fiat/orders", 400, {"code": -1127, "msg": "span too wide"})
+    window_row = _order_row("W1", "10.00", "USD", 1_699_000_000_000)
+    fake = _FakeClient(queue=[span_error, _orders_envelope([window_row], total=1)])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(
+        FiatHistoryInput(kind="withdrawals", since=since_ms, resume_before=initial_end_ms, max_calls=2)
+    )
+
+    assert len(fake.calls) == 2
+    assert "fell back to 30-day windows" in result
+    assert "Stopped early" in result
+
+    match = re.search(r"resume_before=(-?\d+)", result)
+    assert match is not None
+    resume_before = int(match.group(1))
+
+    expected_window_start = initial_end_ms - _WINDOW_MS  # since_ms is far below, so max() picks this
+    expected_next_boundary = expected_window_start - 1
+    assert resume_before == expected_next_boundary
+
+    # The window call used the expected [window_start, initial_end_ms] bounds.
+    window_kwargs = fake.calls[1][2]
+    assert window_kwargs["params"]["beginTime"] == expected_window_start
+    assert window_kwargs["params"]["endTime"] == initial_end_ms
+
+    # Chain the emitted cursor into a fresh call: it must become the new endTime.
+    fake2 = _FakeClient(queue=[_orders_envelope([window_row], total=1)])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake2)
+
+    await binance_get_fiat_history(
+        FiatHistoryInput(kind="withdrawals", since=since_ms, resume_before=resume_before, max_calls=5)
+    )
+
+    resumed_kwargs = fake2.calls[0][2]
+    assert resumed_kwargs["params"]["endTime"] == resume_before
 
 
 async def test_fiat_history_resume_before_input_becomes_end_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -302,6 +437,61 @@ async def test_fiat_history_resume_before_input_becomes_end_time(monkeypatch: py
     assert kwargs["params"]["endTime"] == 1700000000999
 
 
+async def test_fiat_history_dedupes_by_order_no(monkeypatch: pytest.MonkeyPatch) -> None:
+    recent_since_ms = int(time.time() * 1000) - 5 * 24 * 60 * 60 * 1000
+    span_error = _status_error("/sapi/v1/fiat/orders", 400, {"code": -1127, "msg": "span too wide"})
+    dup_row_a = _order_row("DUP1", "1.00", "USD", recent_since_ms + 1000)
+    dup_row_b = dict(dup_row_a)
+    fake = _FakeClient(queue=[span_error, _orders_envelope([dup_row_a, dup_row_b], total=2)])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", since=recent_since_ms, max_calls=10))
+
+    assert result.count("**DUP1**") == 1
+
+
+async def test_fiat_history_default_max_calls_for_deposits_is_four(monkeypatch: pytest.MonkeyPatch) -> None:
+    full_page = _orders_envelope(
+        [_order_row("H1", "1.00", "USD", 1700000000000), _order_row("H2", "1.00", "USD", 1700000001000)], total=999
+    )
+    fake = _FakeClient(queue=[full_page, full_page, full_page, full_page])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", rows=2))
+
+    assert len(fake.calls) == 4  # default budget for deposits/withdrawals: UID 45000/call
+    assert "Stopped early" in result
+
+
+async def test_fiat_history_default_max_calls_for_buys_is_twenty(monkeypatch: pytest.MonkeyPatch) -> None:
+    full_page = _orders_envelope([_payment_row("P1", "1.00", "USD", "0.0001", "BTC", 1700000000000)], total=999)
+    fake = _FakeClient(queue=[full_page] * 5 + [_orders_envelope([], total=6)])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(FiatHistoryInput(kind="buys", rows=1))
+
+    assert len(fake.calls) == 6  # well under the default budget of 20 for buys/sells
+    assert "Stopped early" not in result
+
+
+async def test_fiat_history_malformed_since_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeClient(queue=[])
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: fake)
+
+    result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", since="not-a-date"))
+
+    assert result.startswith("Error: since must be epoch milliseconds or an ISO-8601 string")
+    assert fake.calls == []
+
+
 def test_fiat_history_rejects_bad_kind() -> None:
     with pytest.raises(ValidationError):
         FiatHistoryInput(kind="bogus")  # type: ignore[arg-type]
+
+
+@pytest.mark.live
+async def test_fiat_history_live_smoke() -> None:
+    """Live smoke: read-only, needs BINANCE_API_KEY + secret/PEM in the environment.
+    Not runnable on the spot testnet — /sapi does not exist there."""
+    result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", max_calls=1))
+    assert not result.startswith("Error: unexpected failure")
