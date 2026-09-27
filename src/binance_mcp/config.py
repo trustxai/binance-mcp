@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_API_URL = "https://api.binance.com"
@@ -51,6 +52,15 @@ class Settings(BaseSettings):
     # Off by default: those tools return an error until BINANCE_ALLOW_TRADING=1.
     # `POST /api/v3/order/test` (dry-run validation) is always allowed.
     binance_allow_trading: bool = False
+
+    # MCP clients pass these via a JSON `env` block, where a pasted value often keeps a
+    # trailing space/newline: the key then fails as a header value (and that error echoes
+    # it back), the secret signs wrong (-1022), and the PEM path is "not found".
+    # The passphrase is left as-is: it may legitimately start or end with a space.
+    @field_validator("binance_api_key", "binance_api_secret", "binance_private_key_path", mode="before")
+    @classmethod
+    def _strip_whitespace(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
 
     @property
     def has_api_key(self) -> bool:
