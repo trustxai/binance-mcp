@@ -32,6 +32,8 @@ Three rails, all enforced in the HTTP client — not in the tools — so no tool
 
 Everything else is read-only and works with a key that only has "Enable Reading".
 
+Found a way around one of these rails? Report it privately — see [SECURITY.md](SECURITY.md).
+
 ## Features
 
 - **Your whole history, since the account was created.** Deposits, withdrawals, fiat
