@@ -4,11 +4,21 @@ Binance error bodies are ``{"code": -1121, "msg": "Invalid symbol."}``; the HTTP
 status says *which family* (4xx malformed/auth, 429/418 limits, 5xx Binance side) and
 the negative ``code`` says *what*. Both are surfaced, plus a hint for the codes that
 have a known fix.
+
+Every returned string goes to the LLM transcript, so it is scrubbed of configured
+credential values, and transport errors (whose text can quote a request header, i.e.
+the API key) are described by type only.
 """
 
 from __future__ import annotations
 
 import httpx
+
+from binance_mcp.config import get_settings
+
+# Configured values shorter than this are not redacted: a tiny test value such as
+# "key" would otherwise mangle ordinary words in the message.
+_MIN_REDACT_LEN = 8
 
 # Codes worth a hint. Full list: https://developers.binance.com/docs/binance-spot-api-docs/errors
 _CODE_HINTS: dict[int, str] = {
@@ -67,12 +77,40 @@ def _detail_from_body(resp: httpx.Response) -> tuple[int | None, str]:
     return None, resp.text[:300]
 
 
+def _redact(text: str) -> str:
+    """Replace every configured credential value in `text` with ``***``.
+
+    Covers the API key, HMAC secret and PEM passphrase, each in its raw and
+    whitespace-stripped form. Values under `_MIN_REDACT_LEN` characters (after
+    stripping) are skipped. If settings cannot be loaded (e.g. an invalid env var),
+    the text is returned as-is rather than failing the tool.
+    """
+    try:
+        settings = get_settings()
+    except (ValueError, OSError):  # pydantic ValidationError / SettingsError are ValueErrors
+        return text
+    values: set[str] = set()
+    for raw in (settings.binance_api_key, settings.binance_api_secret, settings.binance_private_key_passphrase):
+        stripped = raw.strip()
+        if len(stripped) >= _MIN_REDACT_LEN:
+            values.update((raw, stripped))
+    # Longest first, so a value that contains another is replaced whole.
+    for value in sorted(values, key=len, reverse=True):
+        text = text.replace(value, "***")
+    return text
+
+
 def handle_api_error(exc: Exception) -> str:
     """Map an exception to a human-readable `Error ...` string for the LLM.
 
     Tools never raise: every tool body is wrapped in try/except and returns
-    this string on failure.
+    this string on failure. The string never carries a configured credential.
     """
+    return _redact(_describe(exc))
+
+
+def _describe(exc: Exception) -> str:
+    """Unredacted message for `handle_api_error`."""
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         code, detail = _detail_from_body(exc.response)
@@ -111,6 +149,14 @@ def handle_api_error(exc: Exception) -> str:
         )
     if isinstance(exc, httpx.ConnectError):
         return "Error: could not connect to the Binance API. Check network access and BINANCE_API_URL."
+    # After the timeout/connect branches (both subclasses). Never include str(exc): h11's
+    # "Illegal header value b'...'" quotes the header verbatim, i.e. the API key.
+    if isinstance(exc, httpx.TransportError):
+        return (
+            f"Error: the Binance API request failed at the transport layer ({type(exc).__name__}). A header/protocol "
+            "error usually means stray whitespace or newlines in BINANCE_API_KEY — re-check the value. Execution "
+            "status is UNKNOWN for a mutating call — check before retrying."
+        )
     if isinstance(exc, RuntimeError):
         return f"Error: {exc}"
     return f"Error: unexpected failure – {type(exc).__name__}: {exc}"
