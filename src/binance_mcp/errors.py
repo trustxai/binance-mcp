@@ -77,11 +77,12 @@ def _detail_from_body(resp: httpx.Response) -> tuple[int | None, str]:
     return None, resp.text[:300]
 
 
-def _redact(text: str) -> str:
+def redact_credentials(text: str) -> str:
     """Replace every configured credential value in `text` with ``***``.
 
-    Covers the API key, HMAC secret and PEM passphrase, each in its raw and
-    whitespace-stripped form. Values under `_MIN_REDACT_LEN` characters (after
+    Covers the API key, HMAC secret and PEM passphrase — plus the private-key path
+    when it holds key material (the PEM text pasted in place of a path) — each in its
+    raw and whitespace-stripped form. Values under `_MIN_REDACT_LEN` characters (after
     stripping) are skipped. If settings cannot be loaded (e.g. an invalid env var),
     the text is returned as-is rather than failing the tool.
     """
@@ -89,11 +90,16 @@ def _redact(text: str) -> str:
         settings = get_settings()
     except (ValueError, OSError):  # pydantic ValidationError / SettingsError are ValueErrors
         return text
+    candidates = [settings.binance_api_key, settings.binance_api_secret, settings.binance_private_key_passphrase]
+    if "-----BEGIN" in settings.binance_private_key_path:
+        candidates.append(settings.binance_private_key_path)
     values: set[str] = set()
-    for raw in (settings.binance_api_key, settings.binance_api_secret, settings.binance_private_key_passphrase):
+    for raw in candidates:
         stripped = raw.strip()
         if len(stripped) >= _MIN_REDACT_LEN:
-            values.update((raw, stripped))
+            # Also the escaped form: OSError and h11 quote values via repr, so a newline
+            # inside one shows up as a literal backslash-n.
+            values.update((raw, stripped, repr(raw)[1:-1], repr(stripped)[1:-1]))
     # Longest first, so a value that contains another is replaced whole.
     for value in sorted(values, key=len, reverse=True):
         text = text.replace(value, "***")
@@ -106,7 +112,7 @@ def handle_api_error(exc: Exception) -> str:
     Tools never raise: every tool body is wrapped in try/except and returns
     this string on failure. The string never carries a configured credential.
     """
-    return _redact(_describe(exc))
+    return redact_credentials(_describe(exc))
 
 
 def _describe(exc: Exception) -> str:
@@ -149,13 +155,23 @@ def _describe(exc: Exception) -> str:
         )
     if isinstance(exc, httpx.ConnectError):
         return "Error: could not connect to the Binance API. Check network access and BINANCE_API_URL."
-    # After the timeout/connect branches (both subclasses). Never include str(exc): h11's
-    # "Illegal header value b'...'" quotes the header verbatim, i.e. the API key.
+    # After the timeout/connect branches (all TransportError subclasses). Never include
+    # str(exc): h11's "Illegal header value b'...'" quotes the header verbatim, i.e. the API key.
+    if isinstance(exc, httpx.LocalProtocolError):
+        return (
+            "Error: the HTTP client rejected the Binance API request (LocalProtocolError). This usually means "
+            "stray whitespace or newlines in BINANCE_API_KEY — re-check the value. Execution status is UNKNOWN for "
+            "a mutating call — check before retrying."
+        )
+    if isinstance(exc, httpx.UnsupportedProtocol):
+        return (
+            "Error: BINANCE_API_URL is not an http(s) URL — it must start with https:// (e.g. https://api.binance.com)."
+        )
     if isinstance(exc, httpx.TransportError):
         return (
-            f"Error: the Binance API request failed at the transport layer ({type(exc).__name__}). A header/protocol "
-            "error usually means stray whitespace or newlines in BINANCE_API_KEY — re-check the value. Execution "
-            "status is UNKNOWN for a mutating call — check before retrying."
+            f"Error: the Binance API request failed at the network layer ({type(exc).__name__}). Check network "
+            "access, any HTTPS_PROXY setting, and BINANCE_API_URL. Execution status is UNKNOWN for a mutating call "
+            "— check before retrying."
         )
     if isinstance(exc, RuntimeError):
         return f"Error: {exc}"

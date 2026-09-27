@@ -241,3 +241,49 @@ def test_timeout_and_connect_branches_unchanged(monkeypatch: pytest.MonkeyPatch,
     # Both are TransportError subclasses: the new transport branch must not shadow them.
     _configure(monkeypatch, BINANCE_API_KEY=_FAKE_KEY)
     assert handle_api_error(exc) == expected
+
+
+# --- review follow-ups: hints that match the failure, key material in other fields ---
+
+
+def test_unsupported_protocol_points_at_the_url_not_the_key() -> None:
+    result = handle_api_error(httpx.UnsupportedProtocol("Request URL is missing an 'http://' or 'https://' protocol."))
+    assert "BINANCE_API_URL" in result
+    assert "BINANCE_API_KEY" not in result
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.ProxyError],
+    ids=lambda cls: cls.__name__,
+)
+def test_network_transport_errors_do_not_blame_the_key(make_exc: Callable[[str], Exception]) -> None:
+    result = handle_api_error(make_exc(f"boom {_FAKE_KEY}"))
+    assert _FAKE_KEY not in result
+    assert type(make_exc("x")).__name__ in result
+    assert "BINANCE_API_KEY" not in result
+    assert "UNKNOWN" in result
+
+
+_FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\n-----END PRIVATE KEY-----\n"
+
+
+def test_pem_text_in_the_path_variable_is_redacted_even_when_repr_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # OSError formats the filename with repr(), so the PEM's newlines arrive as a literal "\n".
+    _configure(monkeypatch, BINANCE_PRIVATE_KEY_PATH=_FAKE_PEM)
+    result = handle_api_error(FileNotFoundError(2, "No such file or directory", _FAKE_PEM.strip()))
+    assert "BEGIN PRIVATE KEY" not in result
+    assert "FAKEFAKE" not in result
+
+
+def test_real_pem_path_is_not_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A genuine path is not a secret, and hiding it would make "file not found" useless.
+    _configure(monkeypatch, BINANCE_PRIVATE_KEY_PATH="/home/me/.config/binance/ed25519.pem")
+    assert handle_api_error(RuntimeError("see /home/me/.config/binance/ed25519.pem")).endswith("ed25519.pem")
+
+
+def test_key_with_internal_newline_is_redacted_in_repr_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = "FAKEKEY\n1234567890abcdef"
+    _configure(monkeypatch, BINANCE_API_KEY=key)
+    result = handle_api_error(ValueError(f"Illegal header value b{key!r}"))
+    assert "1234567890abcdef" not in result

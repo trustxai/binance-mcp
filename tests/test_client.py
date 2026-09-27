@@ -380,3 +380,21 @@ async def test_http_error_raises_status_error() -> None:
     client = _client_with(handler)
     with pytest.raises(httpx.HTTPStatusError):
         await client.request("GET", "/api/v3/ticker/price", params={"symbol": "NOPE"})
+
+
+async def test_pem_text_in_path_variable_is_never_echoed() -> None:
+    # A common mix-up: the PEM *text* pasted into BINANCE_PRIVATE_KEY_PATH. The OS error
+    # would quote the whole value — the private key — so the client must not surface it.
+    pem = (
+        ed25519.Ed25519PrivateKey.generate()
+        .private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        .decode()
+    )
+    client = _client_with(_ok_handler({}), binance_private_key_path=pem)
+
+    with pytest.raises(RuntimeError) as info:
+        await client.request("GET", "/api/v3/account", auth="signed")
+
+    assert "BEGIN" not in str(info.value)
+    assert "must be the path to a PEM file" in str(info.value)
+    assert info.value.__suppress_context__  # `from None`: the OSError is not chained

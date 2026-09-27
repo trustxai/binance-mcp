@@ -21,7 +21,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
 from binance_mcp.client import BinanceClient, get_client
-from binance_mcp.errors import handle_api_error
+from binance_mcp.errors import handle_api_error, redact_credentials
 from binance_mcp.formatters import ResponseFormat, clip_response, epoch_to_human, fmt_num, paginated_response, to_json
 from binance_mcp.server import mcp
 
@@ -334,7 +334,7 @@ async def binance_get_fiat_orders(params: FiatOrdersInput) -> str:
             response += _markdown_truncation_note(MAX_DISPLAY_ROWS, len(data), params.page + 1)
         return response
     except ValueError as exc:
-        return f"Error: {exc}"
+        return f"Error: {redact_credentials(str(exc))}"
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -420,7 +420,7 @@ async def binance_get_fiat_payments(params: FiatPaymentsInput) -> str:
             response += _markdown_truncation_note(MAX_DISPLAY_ROWS, len(data), params.page + 1)
         return response
     except ValueError as exc:
-        return f"Error: {exc}"
+        return f"Error: {redact_credentials(str(exc))}"
     except Exception as exc:
         return handle_api_error(exc)
 
@@ -737,6 +737,6 @@ async def binance_get_fiat_history(params: FiatHistoryInput) -> str:
             lines.append("_No items._")
         return clip_response("\n".join(lines))
     except ValueError as exc:
-        return f"Error: {exc}"
+        return f"Error: {redact_credentials(str(exc))}"
     except Exception as exc:
         return handle_api_error(exc)

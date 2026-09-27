@@ -10,6 +10,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from binance_mcp.config import get_settings
 from binance_mcp.tools.fiat import (
     _WINDOW_MS,
     MAX_DISPLAY_ROWS,
@@ -594,3 +595,26 @@ async def test_fiat_history_live_smoke() -> None:
     Not runnable on the spot testnet — /sapi does not exist there."""
     result = await binance_get_fiat_history(FiatHistoryInput(kind="deposits", max_calls=1))
     assert not result.startswith("Error: unexpected failure")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: binance_get_fiat_orders(FiatOrdersInput(transaction_type="deposit")),
+        lambda: binance_get_fiat_payments(FiatPaymentsInput(transaction_type="buy")),
+        lambda: binance_get_fiat_history(FiatHistoryInput(kind="deposits", rows=100)),
+    ],
+    ids=["orders", "payments", "history"],
+)
+async def test_fiat_value_error_branch_redacts_credentials(monkeypatch: pytest.MonkeyPatch, call: Any) -> None:
+    # These tools answer ValueError with "Error: {exc}" (bypassing handle_api_error), so the
+    # branch must redact on its own — a ValueError from the client could quote a credential.
+    key = "FAKEKEY1234567890abcdef"
+    monkeypatch.setenv("BINANCE_API_KEY", key)
+    get_settings.cache_clear()
+    monkeypatch.setattr("binance_mcp.tools.fiat.get_client", lambda: _FakeClient(queue=[ValueError(f"bad {key}")]))
+
+    result = await call()
+
+    assert key not in result
+    assert "bad ***" in result  # history reports mid-walk failures via handle_api_error
