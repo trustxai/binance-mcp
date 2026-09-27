@@ -11,7 +11,7 @@ GitHub:
 1. Open the repository's **Security** tab → **Report a vulnerability**
    (direct link: <https://github.com/trustxai/binance-mcp/security/advisories/new>).
 2. Include:
-   - the version (`pip show amazing-binance-mcp`, or the commit SHA);
+   - the version you ran (the PyPI release, e.g. `0.1.0`, or the commit SHA);
    - the settings involved — variable **names** only, e.g. whether
      `BINANCE_ALLOW_TRADING` or `BINANCE_TESTNET` was set;
    - the tool calls and steps to reproduce, and what an attacker gains.
@@ -44,7 +44,7 @@ fixes ship as a new release, not as backports.
 | Version | Supported |
 |---|---|
 | Latest `0.x` release | ✅ |
-| Anything older | ❌ — upgrade with `uvx amazing-binance-mcp@latest` |
+| Anything older | ❌ — use `amazing-binance-mcp@latest` in your client's `args` (or run `uvx --refresh amazing-binance-mcp` once), then restart the client |
 
 ## Scope
 
@@ -56,7 +56,8 @@ before anything is signed, so no tool can skip them.
 **In scope**
 
 - **Reaching a withdrawal or fiat-rail endpoint** through any tool, under any
-  configuration — the client refuses these paths even when the key could call them.
+  configuration. Request paths are fixed in code, so no tool calls one, and the client
+  also refuses the known withdrawal and fiat-rail paths even when the key could call them.
 - **Moving funds or changing account state with trading off** — placing, cancelling or
   replacing orders, transfers, convert, TWAP or dust conversion while
   `BINANCE_ALLOW_TRADING` is unset. The order dry-runs and a short allowlist of
@@ -90,25 +91,40 @@ before anything is signed, so no tool can skip them.
 
 ## What the server does with your credentials
 
-- The API key is sent **only** in the `X-MBX-APIKEY` header, and only to
-  `BINANCE_API_URL` (default `https://api.binance.com`).
+- The API key is sent **only** in the `X-MBX-APIKEY` header, and only to the REST base
+  URL — `BINANCE_API_URL` (default `https://api.binance.com`), or the testnet when
+  `BINANCE_TESTNET=1`.
 - The HMAC secret and the private key **never leave the process** — only signatures do,
   and a signed request is valid only within `BINANCE_RECV_WINDOW_MS` of its timestamp.
-- Nothing is logged, and no credential is echoed in tool output.
+- The key, the secret and the passphrase never appear in the server's logs. Tool output
+  does not include them either, with one exception listed under
+  [Known limitations](#known-limitations).
 - The server speaks MCP over **stdio only**: it opens no port and has no HTTP/SSE
-  transport. Its only outbound connections go to the REST base URL.
+  transport. Its only outbound connections go to the REST base URL (through your proxy,
+  if `HTTPS_PROXY` is set).
 
 ## Known limitations
 
 - **Prompt injection through Binance data.** Some tool output contains text chosen by
   other people — for example the counterparty names in `binance_get_pay_history` and
   `binance_get_pay_transactions`. Anyone can send you a small Pay transfer under a name
-  that reads like an instruction to the model. With trading off, the worst outcome is a
-  misleading answer. With trading on, the model could be talked into placing or
-  cancelling orders, transfers or converts inside your account — never a withdrawal.
+  that reads like an instruction to the model. With trading off, this server cannot move
+  funds, but injected text can still mislead the model or steer your client's other
+  tools — for example into sending your balances or history somewhere else. With trading
+  on, the model could also be talked into placing or cancelling orders, transfers or
+  converts inside your account. None of that is a withdrawal, but a trade into a thin
+  market the attacker controls can drain value just the same.
 - **The kill-switch is all or nothing.** `BINANCE_ALLOW_TRADING=1` unlocks every 🔒 tool;
   the server has no per-tool, per-symbol or amount limits. What remains are the key's
   own permissions and your MCP client's approval prompts.
+- **Requests are logged to stderr.** The HTTP library logs each request line — URL,
+  parameters, timestamp and signature, never the key or secret — and most MCP clients
+  save the server's stderr to a log file. A logged signature authorizes only that exact
+  request, within `BINANCE_RECV_WINDOW_MS` of its timestamp, but the log does record
+  what you queried and traded.
+- **A key with stray whitespace is echoed.** If `BINANCE_API_KEY` has a leading or
+  trailing space or newline, the HTTP library rejects the header and the error message
+  returned to the model contains the key. Paste keys without surrounding whitespace.
 
 ## Running it safely
 
@@ -121,9 +137,10 @@ before anything is signed, so no tool can skip them.
   only in that client's `env`. Try new flows on the testnet first (`BINANCE_TESTNET=1`).
 - **Keep approval prompts on** for the 🔒 tools in your MCP client, above all with
   trading enabled — they are the human check against prompt injection.
-- **Guard your client config.** MCP client config files hold the `env` block in plain
-  text; keep them out of dotfile repositories and shared backups. (`.env` and `*.pem`
-  are git-ignored in this repository.)
+- **Guard your client config and logs.** MCP client config files hold the `env` block in
+  plain text, and the client's log folder holds the request log; keep both out of
+  dotfile repositories and shared backups. (`.env` and `*.pem` are git-ignored in this
+  repository.)
 - **Point `BINANCE_API_URL` only at Binance hosts** — the key header goes wherever it
   points.
 - **If a key leaks, delete it first** in Binance → API Management, then create a new one.
