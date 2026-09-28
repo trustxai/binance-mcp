@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.1](https://github.com/trustxai/binance-mcp/compare/v0.1.0...v0.1.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **client:** never echo BINANCE_PRIVATE_KEY_PATH; transport hints that match the failure ([e46fdb9](https://github.com/trustxai/binance-mcp/commit/e46fdb96441659f518e18562a57c2a2ceaa03aa9))
+* **config:** strip stray whitespace from the API key, secret and PEM path ([3bcd9f3](https://github.com/trustxai/binance-mcp/commit/3bcd9f359ece00f10a4047a3f6b97e6325548810))
+* **errors:** never echo exception text that can carry credentials ([2c82882](https://github.com/trustxai/binance-mcp/commit/2c82882fdb4e4941801f47da93893fb2137730e5))
+* keep credentials and signed query strings out of logs and tool output ([4c5bcbb](https://github.com/trustxai/binance-mcp/commit/4c5bcbbe2a7d8dc3d07206a56320295389451931))
+* **logging:** keep httpx request lines (signed query strings) out of stderr ([c2baeb2](https://github.com/trustxai/binance-mcp/commit/c2baeb2aedf31af1767330ffaaa80cec8bee195d))
+
 ## 0.1.0 (2026-09-23)
 
 
