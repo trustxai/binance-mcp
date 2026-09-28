@@ -50,6 +50,37 @@ def test_pem_path_counts_as_credentials(monkeypatch: pytest.MonkeyPatch) -> None
     assert Settings().has_credentials is True
 
 
+@pytest.mark.parametrize("pad", [" ", "\t", "\n", " \t\n"])
+def test_credentials_are_stripped(monkeypatch: pytest.MonkeyPatch, pad: str) -> None:
+    # A pasted key with a trailing space/newline is an illegal header value, and the
+    # resulting error echoes the key back to the model.
+    monkeypatch.setenv("BINANCE_API_KEY", f"{pad}FAKEKEY123{pad}")
+    monkeypatch.setenv("BINANCE_API_SECRET", f"{pad}fakesecret456{pad}")
+    monkeypatch.setenv("BINANCE_PRIVATE_KEY_PATH", f"{pad}/tmp/fake-ed25519.pem{pad}")
+    settings = Settings()
+    assert settings.binance_api_key == "FAKEKEY123"
+    assert settings.binance_api_secret == "fakesecret456"
+    assert settings.binance_private_key_path == "/tmp/fake-ed25519.pem"
+    assert settings.has_credentials is True
+
+
+def test_passphrase_is_not_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BINANCE_PRIVATE_KEY_PASSPHRASE", "  fake pass phrase  ")
+    assert Settings().binance_private_key_passphrase == "  fake pass phrase  "
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\n"])
+def test_blank_credentials_are_empty(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    for var in ("BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_PRIVATE_KEY_PATH"):
+        monkeypatch.setenv(var, value)
+    settings = Settings()
+    assert settings.binance_api_key == ""
+    assert settings.binance_api_secret == ""
+    assert settings.binance_private_key_path == ""
+    assert settings.has_api_key is False
+    assert settings.has_credentials is False
+
+
 def test_testnet_switches_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BINANCE_TESTNET", "true")
     assert Settings().base_url == TESTNET_API_URL

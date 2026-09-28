@@ -147,7 +147,15 @@ class BinanceClient:
         if self._private_key is None:
             from cryptography.hazmat.primitives import serialization
 
-            pem = Path(self._settings.binance_private_key_path).expanduser().read_bytes()
+            try:
+                pem = Path(self._settings.binance_private_key_path).expanduser().read_bytes()
+            except OSError as exc:
+                # Never echo the value: pasting the PEM *text* here instead of a path is a
+                # common mix-up, and the OS error would quote it — the private key — back.
+                raise RuntimeError(
+                    f"BINANCE_PRIVATE_KEY_PATH could not be read ({exc.strerror or type(exc).__name__}). "
+                    "It must be the path to a PEM file, not the key text itself."
+                ) from None
             passphrase = self._settings.binance_private_key_passphrase.encode() or None
             self._private_key = serialization.load_pem_private_key(pem, password=passphrase)
         return self._private_key

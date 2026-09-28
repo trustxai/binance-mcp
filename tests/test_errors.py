@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import httpx
+import pytest
 
 from binance_mcp.client import BinanceEnvelopeError, ForbiddenEndpointError, TradingDisabledError
+from binance_mcp.config import get_settings
 from binance_mcp.errors import handle_api_error
+
+# Fake credentials only. The conftest autouse fixture strips ambient BINANCE_* vars
+# and chdirs away from any .env, so these are the only values Settings can see.
+_FAKE_KEY = "FAKEKEY1234567890abcdef"
+_FAKE_SECRET = "FAKESECRETzyxwvu0987654321"
+_FAKE_PASSPHRASE = "FAKEPASSPHRASE-hunter2"
 
 
 def _status_error(
@@ -119,3 +128,162 @@ def test_unexpected_exception() -> None:
     result = handle_api_error(ValueError("odd"))
     assert "unexpected failure" in result
     assert "ValueError" in result
+
+
+# --- credential exposure -------------------------------------------------------------
+
+
+def _configure(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "header_value",
+    [f"b'{_FAKE_KEY} '", f"b'{_FAKE_KEY}\\n'", f"b'FAKEKEY\\n{_FAKE_KEY}'"],
+    ids=["trailing-space", "trailing-newline", "internal-newline"],
+)
+def test_transport_error_never_echoes_header_value(header_value: str) -> None:
+    # No credentials configured: the transport branch must hold without redaction.
+    result = handle_api_error(httpx.LocalProtocolError(f"Illegal header value {header_value}"))
+    assert _FAKE_KEY not in result
+    assert "Illegal header value" not in result
+    assert "LocalProtocolError" in result
+    assert "whitespace" in result
+    assert "BINANCE_API_KEY" in result
+    assert "UNKNOWN" in result
+
+
+def test_transport_error_other_subclass_names_type() -> None:
+    result = handle_api_error(httpx.RemoteProtocolError(f"peer closed: {_FAKE_KEY}"))
+    assert _FAKE_KEY not in result
+    assert "RemoteProtocolError" in result
+
+
+_CREDENTIALS = [
+    ("BINANCE_API_KEY", _FAKE_KEY),
+    ("BINANCE_API_SECRET", _FAKE_SECRET),
+    ("BINANCE_PRIVATE_KEY_PASSPHRASE", _FAKE_PASSPHRASE),
+]
+_CREDENTIAL_IDS = ["key", "secret", "passphrase"]
+
+_EXCEPTIONS: list[Callable[[str], Exception]] = [ValueError, RuntimeError, KeyError]
+
+
+@pytest.mark.parametrize(("env_name", "value"), _CREDENTIALS, ids=_CREDENTIAL_IDS)
+@pytest.mark.parametrize("make_exc", _EXCEPTIONS, ids=lambda cls: cls.__name__)
+def test_configured_credential_is_redacted(
+    monkeypatch: pytest.MonkeyPatch, env_name: str, value: str, make_exc: Callable[[str], Exception]
+) -> None:
+    _configure(monkeypatch, **{env_name: value})
+    result = handle_api_error(make_exc(f"something mentioned {value} here"))
+    assert value not in result
+    assert "something mentioned *** here" in result
+
+
+def test_runtime_error_redaction_keeps_the_rest_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch, BINANCE_API_KEY=_FAKE_KEY, BINANCE_API_SECRET=_FAKE_SECRET)
+    result = handle_api_error(RuntimeError(f"key={_FAKE_KEY} secret={_FAKE_SECRET}"))
+    assert result == "Error: key=*** secret=***"
+
+
+def test_whitespace_stripped_form_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch, BINANCE_API_KEY=f"  {_FAKE_KEY} \n")
+    result = handle_api_error(ValueError(f"bad key {_FAKE_KEY}!"))
+    assert _FAKE_KEY not in result
+    assert "bad key ***!" in result
+
+
+def test_status_error_body_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch, BINANCE_API_KEY=_FAKE_KEY)
+    result = handle_api_error(_status_error(400, {"code": -1100, "msg": f"Illegal characters in {_FAKE_KEY}"}))
+    assert _FAKE_KEY not in result
+    assert result.startswith("Error (400)")
+
+
+def test_short_configured_values_do_not_mangle_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both values appear in the message, but under 8 chars they are not treated as secrets.
+    _configure(monkeypatch, BINANCE_API_KEY="key", BINANCE_API_SECRET="Binance")
+    assert handle_api_error(RuntimeError("No Binance API key configured.")) == "Error: No Binance API key configured."
+
+
+def test_whitespace_only_value_does_not_mangle_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch, BINANCE_API_SECRET=" " * 12)
+    message = "spaced            out"
+    assert handle_api_error(RuntimeError(message)) == f"Error: {message}"
+
+
+def test_unloadable_settings_returns_text_unredacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An invalid env var makes get_settings() raise; the tool must still get its message.
+    _configure(monkeypatch, BINANCE_RECV_WINDOW_MS="not-a-number")
+    assert handle_api_error(RuntimeError("boom")) == "Error: boom"
+
+
+_TIMEOUT_MESSAGE = (
+    "Error: the Binance API request timed out. Execution status is UNKNOWN for a mutating call — check "
+    "before retrying. Raise BINANCE_REQUEST_TIMEOUT_SECONDS if this recurs."
+)
+_CONNECT_MESSAGE = "Error: could not connect to the Binance API. Check network access and BINANCE_API_URL."
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (httpx.TimeoutException("slow"), _TIMEOUT_MESSAGE),
+        (httpx.ReadTimeout("slow"), _TIMEOUT_MESSAGE),
+        (httpx.ConnectTimeout("slow"), _TIMEOUT_MESSAGE),
+        (httpx.ConnectError("refused"), _CONNECT_MESSAGE),
+    ],
+    ids=["timeout", "read-timeout", "connect-timeout", "connect-error"],
+)
+def test_timeout_and_connect_branches_unchanged(monkeypatch: pytest.MonkeyPatch, exc: Exception, expected: str) -> None:
+    # Both are TransportError subclasses: the new transport branch must not shadow them.
+    _configure(monkeypatch, BINANCE_API_KEY=_FAKE_KEY)
+    assert handle_api_error(exc) == expected
+
+
+# --- review follow-ups: hints that match the failure, key material in other fields ---
+
+
+def test_unsupported_protocol_points_at_the_url_not_the_key() -> None:
+    result = handle_api_error(httpx.UnsupportedProtocol("Request URL is missing an 'http://' or 'https://' protocol."))
+    assert "BINANCE_API_URL" in result
+    assert "BINANCE_API_KEY" not in result
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.ProxyError],
+    ids=lambda cls: cls.__name__,
+)
+def test_network_transport_errors_do_not_blame_the_key(make_exc: Callable[[str], Exception]) -> None:
+    result = handle_api_error(make_exc(f"boom {_FAKE_KEY}"))
+    assert _FAKE_KEY not in result
+    assert type(make_exc("x")).__name__ in result
+    assert "BINANCE_API_KEY" not in result
+    assert "UNKNOWN" in result
+
+
+_FAKE_PEM = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\n-----END PRIVATE KEY-----\n"
+
+
+def test_pem_text_in_the_path_variable_is_redacted_even_when_repr_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # OSError formats the filename with repr(), so the PEM's newlines arrive as a literal "\n".
+    _configure(monkeypatch, BINANCE_PRIVATE_KEY_PATH=_FAKE_PEM)
+    result = handle_api_error(FileNotFoundError(2, "No such file or directory", _FAKE_PEM.strip()))
+    assert "BEGIN PRIVATE KEY" not in result
+    assert "FAKEFAKE" not in result
+
+
+def test_real_pem_path_is_not_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A genuine path is not a secret, and hiding it would make "file not found" useless.
+    _configure(monkeypatch, BINANCE_PRIVATE_KEY_PATH="/home/me/.config/binance/ed25519.pem")
+    assert handle_api_error(RuntimeError("see /home/me/.config/binance/ed25519.pem")).endswith("ed25519.pem")
+
+
+def test_key_with_internal_newline_is_redacted_in_repr_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = "FAKEKEY\n1234567890abcdef"
+    _configure(monkeypatch, BINANCE_API_KEY=key)
+    result = handle_api_error(ValueError(f"Illegal header value b{key!r}"))
+    assert "1234567890abcdef" not in result
