@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/trustxai/binance-mcp/compare/v0.1.1...v0.1.2) (2026-09-28)
+
+
+### Documentation
+
+* add SECURITY.md — private reporting, scope, known limitations, safe-use guide ([b7b6762](https://github.com/trustxai/binance-mcp/commit/b7b6762060decb7aeb82208c332515aedff3b79f))
+* **security:** reflect the 0.1.1 fixes; drop the two resolved limitations ([b893c0a](https://github.com/trustxai/binance-mcp/commit/b893c0abfb1865176cbff29e1fdd6dcfb8f78289))
+
 ## [0.1.1](https://github.com/trustxai/binance-mcp/compare/v0.1.0...v0.1.1) (2026-09-28)
 
 
