@@ -32,6 +32,8 @@ Three rails, all enforced in the HTTP client — not in the tools — so no tool
 
 Everything else is read-only and works with a key that only has "Enable Reading".
 
+Found a way around one of these rails? Report it privately — see [SECURITY.md](SECURITY.md).
+
 ## Features
 
 - **Your whole history, since the account was created.** Deposits, withdrawals, fiat
@@ -329,9 +331,10 @@ a `recvWindow` and a `signature` over the query string:
 - **HMAC key**: `BINANCE_API_SECRET` produces the HMAC-SHA256 hex signature. Supported,
   but Binance has deprecated HMAC keys.
 
-The key is never logged or echoed. Missing credentials fail lazily at the first signed
-request with a clear message; public market data never needs them. The signing code is
-unit-tested against the example vectors Binance publishes in its own documentation.
+The key and secret are never logged, and error messages never quote them (see
+[SECURITY.md](SECURITY.md)). Missing credentials fail lazily at the first signed request
+with a clear message; public market data never needs them. The signing code is unit-tested against the example vectors Binance
+publishes in its own documentation.
 
 ### Environment Variables
 
