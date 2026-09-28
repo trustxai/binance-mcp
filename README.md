@@ -331,10 +331,9 @@ a `recvWindow` and a `signature` over the query string:
 - **HMAC key**: `BINANCE_API_SECRET` produces the HMAC-SHA256 hex signature. Supported,
   but Binance has deprecated HMAC keys.
 
-The key and secret are never logged (the one case where the key can surface in an error
-message is listed in [SECURITY.md](SECURITY.md#known-limitations)). Missing credentials
-fail lazily at the first signed request with a clear message; public market data never
-needs them. The signing code is unit-tested against the example vectors Binance
+The key and secret are never logged, and error messages never quote them (see
+[SECURITY.md](SECURITY.md)). Missing credentials fail lazily at the first signed request
+with a clear message; public market data never needs them. The signing code is unit-tested against the example vectors Binance
 publishes in its own documentation.
 
 ### Environment Variables

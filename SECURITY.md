@@ -46,6 +46,11 @@ fixes ship as a new release, not as backports.
 | Latest `0.x` release | ✅ |
 | Anything older | ❌ — use `amazing-binance-mcp@latest` in your client's `args` (or run `uvx --refresh amazing-binance-mcp` once), then restart the client |
 
+**On 0.1.0? Upgrade.** 0.1.1 fixes three ways a credential or a signed request could leak
+into logs or tool output: signed query strings in the stderr request log, an API key with
+stray whitespace echoed in an error, and PEM text pasted into `BINANCE_PRIVATE_KEY_PATH`
+echoed in an error. See the [changelog](CHANGELOG.md).
+
 ## Scope
 
 The server makes three promises (see the [safety model](README.md#safety-model)).
@@ -96,9 +101,10 @@ before anything is signed, so no tool can skip them.
   `BINANCE_TESTNET=1`.
 - The HMAC secret and the private key **never leave the process** — only signatures do,
   and a signed request is valid only within `BINANCE_RECV_WINDOW_MS` of its timestamp.
-- The key, the secret and the passphrase never appear in the server's logs. Tool output
-  does not include them either, with one exception listed under
-  [Known limitations](#known-limitations).
+- The key, the secret and the passphrase never appear in the server's logs, and the
+  HTTP library logs warnings only, so signed query strings never reach stderr.
+- Error messages never quote a credential: transport errors are described by type
+  only, and every error string a tool returns is scrubbed of the configured values.
 - The server speaks MCP over **stdio only**: it opens no port and has no HTTP/SSE
   transport. Its only outbound connections go to the REST base URL (through your proxy,
   if `HTTPS_PROXY` is set).
@@ -117,14 +123,6 @@ before anything is signed, so no tool can skip them.
 - **The kill-switch is all or nothing.** `BINANCE_ALLOW_TRADING=1` unlocks every 🔒 tool;
   the server has no per-tool, per-symbol or amount limits. What remains are the key's
   own permissions and your MCP client's approval prompts.
-- **Requests are logged to stderr.** The HTTP library logs each request line — URL,
-  parameters, timestamp and signature, never the key or secret — and most MCP clients
-  save the server's stderr to a log file. A logged signature authorizes only that exact
-  request, within `BINANCE_RECV_WINDOW_MS` of its timestamp, but the log does record
-  what you queried and traded.
-- **A key with stray whitespace is echoed.** If `BINANCE_API_KEY` has a leading or
-  trailing space or newline, the HTTP library rejects the header and the error message
-  returned to the model contains the key. Paste keys without surrounding whitespace.
 
 ## Running it safely
 
@@ -137,10 +135,9 @@ before anything is signed, so no tool can skip them.
   only in that client's `env`. Try new flows on the testnet first (`BINANCE_TESTNET=1`).
 - **Keep approval prompts on** for the 🔒 tools in your MCP client, above all with
   trading enabled — they are the human check against prompt injection.
-- **Guard your client config and logs.** MCP client config files hold the `env` block in
-  plain text, and the client's log folder holds the request log; keep both out of
-  dotfile repositories and shared backups. (`.env` and `*.pem` are git-ignored in this
-  repository.)
+- **Guard your client config.** MCP client config files hold the `env` block in plain
+  text; keep them out of dotfile repositories and shared backups. (`.env` and `*.pem`
+  are git-ignored in this repository.)
 - **Point `BINANCE_API_URL` only at Binance hosts** — the key header goes wherever it
   points.
 - **If a key leaks, delete it first** in Binance → API Management, then create a new one.
